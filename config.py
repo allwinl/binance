@@ -1,7 +1,7 @@
 # config.py   ── must be named exactly config.py
 
-API_KEY = 'swNCkZLoqzFnYPreUDrFAAnoAxsx16PcJSDlU3AEpep7MwaOCVXzq3YHUDJkZvu8'
-API_SECRET = 'f7774SEvatAbZJHNP6NYZu6dtAb6zxYUBmxQp6c8d90PbNvlvKLYl1ofF7A1J4qn'
+BINANCE_API_KEY = 'swNCkZLoqzFnYPreUDrFAAnoAxsx16PcJSDlU3AEpep7MwaOCVXzq3YHUDJkZvu8'
+BINANCE_API_SECRET = 'f7774SEvatAbZJHNP6NYZu6dtAb6zxYUBmxQp6c8d90PbNvlvKLYl1ofF7A1J4qn'
 
 
 SYMBOL               = "BTCUSDT"

@@ -39,30 +39,41 @@ configuration = ConfigurationRestAPI(
 
 client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
-# Optional debug: show available REST API methods (comment out after confirmation)
-# print("\nDEBUG: Available methods on client.rest_api:")
-# public_methods = [m for m in dir(client.rest_api) if not m.startswith('_') and callable(getattr(client.rest_api, m))]
-# print(public_methods)
-# print("───────────────────────────────────────────────\n")
-
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def get_klines(symbol, interval, limit=400):
     try:
-        # Using the correct method name from your SDK debug output
         resp = client.rest_api.kline_candlestick_data(
             symbol=symbol,
             interval=interval,
             limit=limit
         )
-        df = pd.DataFrame(resp, columns=[
+
+        # Handle wrapped response (common in SDKs)
+        if isinstance(resp, dict):
+            if 'data' in resp:
+                candles = resp['data']
+            elif 'result' in resp:
+                candles = resp['result']
+            elif 'klines' in resp:
+                candles = resp['klines']
+            else:
+                raise ValueError("No recognizable candle data in response")
+        else:
+            candles = resp  # assume it's already the list
+
+        if not isinstance(candles, list) or not candles:
+            raise ValueError("Candles data is empty or not a list")
+
+        df = pd.DataFrame(candles, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_volume', 'trades', 'taker_base_volume',
             'taker_quote_volume', 'ignore'
         ])
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = pd.to_numeric(df[col])
+        for col in ['open', 'high', 'low', 'close', 'volume', 'quote_volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
         return df
     except Exception as e:
         logger.error(f"kline_candlestick_data failed: {e}")
@@ -77,7 +88,24 @@ def get_daily_open(symbol):
             interval="1d",
             limit=2
         )
-        return float(resp[-1][1])  # open price of current (ongoing) daily candle
+
+        # Same unwrapping logic
+        if isinstance(resp, dict):
+            if 'data' in resp:
+                candles = resp['data']
+            elif 'result' in resp:
+                candles = resp['result']
+            elif 'klines' in resp:
+                candles = resp['klines']
+            else:
+                raise ValueError("No recognizable candle data in response")
+        else:
+            candles = resp
+
+        if not candles or len(candles) < 1:
+            return None
+
+        return float(candles[-1][1])  # open price of most recent candle
     except Exception as e:
         logger.error(f"daily open failed: {e}")
         return None
@@ -85,8 +113,7 @@ def get_daily_open(symbol):
 
 def get_position(symbol):
     try:
-        positions = client.rest_api.position_information_v3(symbol=symbol)  # v3 is usually more complete
-        # fallback to v2 if v3 fails
+        positions = client.rest_api.position_information_v3(symbol=symbol)
     except:
         try:
             positions = client.rest_api.position_information_v2(symbol=symbol)
@@ -120,7 +147,7 @@ def is_short(short_qty: float) -> bool:
 
 def get_usdt_balance():
     try:
-        account = client.rest_api.account_information_v3()  # or v2
+        account = client.rest_api.account_information_v3()
         for asset in account.get('assets', []):
             if asset['asset'] == 'USDT':
                 return float(asset.get('availableBalance', 0.0))
@@ -135,10 +162,7 @@ def set_leverage(symbol, lev):
         client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
         logger.info(f"Leverage set → {lev}x")
     except Exception as e:
-        if "already" in str(e).lower() or "2024" in str(e):
-            logger.info(f"Leverage already set to {lev}x")
-        else:
-            logger.warning(f"leverage warning: {e}")
+        logger.warning(f"leverage set failed (may already be set): {e}")
 
 
 def market_order(symbol, side: str, quantity: float, position_side: str = None):

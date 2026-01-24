@@ -1,21 +1,18 @@
-# config.py
-# NEVER commit this file anywhere public
+# config.py   ── must be named exactly config.py
 
-API_KEY    = "your_actual_api_key_here"
-API_SECRET = "your_actual_api_secret_here"
+API_KEY    = "your_key_here"
+API_SECRET = "your_secret_here"
 
-# Trading settings
-SYMBOL              = "BTCUSDT"
-INTERVAL            = "1h"
-EMA_PERIOD          = 21
-LEVERAGE            = 5
-POSITION_PCT        = 0.03           # 3% of available USDT
+SYMBOL               = "BTCUSDT"
+INTERVAL             = "1h"
+EMA_PERIOD           = 21
+LEVERAGE             = 5
+POSITION_PCT         = 0.03
 DAILY_OPEN_TOLERANCE = 0.003
-MIN_SAFE_BALANCE    = 50.0
+MIN_SAFE_BALANCE     = 50.0
 
-# Very important – control live vs simulation
-RUN_LIVE            = False          # Change to True ONLY after full testing
+RUN_LIVE             = False
+BASE_URL             = "https://testnet.binancefuture.com"   # or None for real money
 
-# URL – use testnet until you're 100% sure
-BASE_URL            = "https://testnet.binancefuture.com"   # ← safe choice for now
-# For real money (after testing): BASE_URL = None
+# This is the line that's missing or misspelled in your file
+SLEEP_SECONDS        = 3600 + 20          # ~1 hour + buffer

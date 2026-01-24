@@ -1,6 +1,7 @@
 # bot.py
 # Simple EMA vs Daily Open strategy – Binance USDS-M Futures
-# Reads ALL settings from config.py
+# Uses official binance-connector-python (UMFutures)
+# All settings from config.py
 
 import time
 import logging
@@ -8,86 +9,111 @@ from datetime import datetime
 import pandas as pd
 
 try:
-    from binance.futures import Futures
+    from binance.um_futures import UMFutures
     from binance.error import ClientError
 except ImportError:
-    print("Please install:  pip install binance-sdk-derivatives-trading-usds-futures")
+    print("Install library first:")
+    print("pip install binance-sdk-derivatives-trading-usds-futures")
     exit(1)
 
 import config
 
-# ─── Logging ────────────────────────────────────────────────
+# ─── Logging setup ────────────────────────────────────────────────
 logging.basicConfig(
-    filename='trading_bot.log',
+    filename='futures_bot.log',
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-5s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
-# ─── Binance client ─────────────────────────────────────────
-if config.RUN_LIVE:
-    client = Futures(key=config.API_KEY, secret=config.API_SECRET)
-    print(">>> LIVE MODE – REAL MONEY – USE WITH EXTREME CAUTION <<<")
-    logger.warning("BOT STARTED IN LIVE MODE")
-else:
-    print(">>> DRY RUN MODE – no real orders will be placed <<<")
-    logger.info("Dry run mode active – no orders sent")
+# ─── Client initialization ────────────────────────────────────────
+kwargs = {
+    "key": config.API_KEY,
+    "secret": config.API_SECRET,
+}
 
-# ─── Helper functions ───────────────────────────────────────
+if config.BASE_URL:
+    kwargs["base_url"] = config.BASE_URL
+    print(">>> Using custom base URL (likely TESTNET) <<<")
+    logger.info("Using custom base URL")
+else:
+    print(">>> LIVE PRODUCTION MODE – REAL MONEY RISK! <<<")
+    logger.warning("LIVE PRODUCTION MODE ACTIVE")
+
+if not config.RUN_LIVE:
+    print("DRY RUN active – NO real orders will be placed!")
+
+client = UMFutures(**kwargs)
+
+# ─── Helper functions ─────────────────────────────────────────────
 
 def get_klines(symbol, interval, limit=300):
     try:
         data = client.klines(symbol, interval, limit=limit)
         df = pd.DataFrame(data, columns=[
-            'ot','o','h','l','c','v','ct','qv','n','tbv','tqv','x'
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'qv', 'trades', 'taker_base', 'taker_quote', 'ignore'
         ])
-        df = df.astype({'o':'float','h':'float','l':'float','c':'float'})
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = pd.to_numeric(df[col])
         return df
-    except Exception as e:
-        logger.error(f"klines failed: {e}")
+    except ClientError as e:
+        logger.error(f"Klines error {e.error_code}: {e.error_message}")
         return None
 
 
 def get_daily_open(symbol):
     try:
         data = client.klines(symbol, "1d", limit=2)
-        return float(data[-1][1])   # open price of current day candle
-    except Exception as e:
-        logger.error(f"daily open failed: {e}")
+        return float(data[-1][1])  # open of current (possibly active) day
+    except ClientError as e:
+        logger.error(f"Daily open error {e.error_code}: {e.error_message}")
         return None
 
 
-def get_position(symbol):
+def get_position_amt(symbol):
     try:
         pos = client.get_position_risk(symbol=symbol)
         if pos and len(pos) > 0:
             return float(pos[0]['positionAmt'])
         return 0.0
-    except Exception as e:
-        logger.error(f"position query failed: {e}")
+    except ClientError as e:
+        logger.error(f"Position error {e.error_code}: {e.error_message}")
         return 0.0
 
 
 def get_usdt_available():
     try:
         acc = client.account()
-        for a in acc['assets']:
-            if a['asset'] == 'USDT':
-                return float(a['availableBalance'])
+        for asset in acc['assets']:
+            if asset['asset'] == 'USDT':
+                return float(asset['availableBalance'])
         return 0.0
-    except Exception as e:
-        logger.error(f"balance query failed: {e}")
+    except ClientError as e:
+        logger.error(f"Balance error {e.error_code}: {e.error_message}")
         return 0.0
 
 
-def market_order(symbol, side, qty):
+def set_leverage(symbol, lev):
+    try:
+        client.change_leverage(symbol=symbol, leverage=lev)
+        msg = f"Leverage set to {lev}x"
+        print(msg)
+        logger.info(msg)
+    except ClientError as e:
+        if e.error_code != -2015:  # ignore "already set" style errors if common
+            logger.warning(f"Leverage set warning {e.error_code}: {e.error_message}")
+
+
+def place_market_order(symbol, side, qty):
     if not config.RUN_LIVE:
-        logger.info(f"DRY RUN – would place {side} order | qty = {qty:.3f}")
-        print(  f"DRY RUN – would place {side} order | qty = {qty:.3f}")
+        logger.info(f"DRY-RUN | would place {side} {qty:.3f} {symbol}")
+        print(  f"DRY-RUN | would place {side} {qty:.3f} {symbol}")
         return None
 
-    qty = round(qty, 3)
+    qty = round(qty, 3)  # BTCUSDT typical — improve with exchangeInfo later
     try:
         order = client.new_order(
             symbol=symbol,
@@ -95,93 +121,92 @@ def market_order(symbol, side, qty):
             type="MARKET",
             quantity=qty
         )
-        msg = f"ORDER OK → {side.upper()} {qty:.3f} {symbol}"
-        logger.info(msg)
+        msg = f"ORDER EXECUTED → {side.upper()} {qty:.3f} {symbol} | ID: {order.get('orderId')}"
         print(msg)
+        logger.info(msg)
         return order
     except ClientError as e:
-        logger.error(f"order failed: {e}")
-        print(f"order failed: {e}")
+        logger.error(f"Order failed {e.error_code}: {e.error_message}")
+        print(f"Order failed {e.error_code}: {e.error_message}")
         return None
 
 
-# ─── Strategy logic ─────────────────────────────────────────
+# ─── Strategy core ────────────────────────────────────────────────
 
-def run_once():
-    df = get_klines(config.SYMBOL, config.INTERVAL)
-    if df is None or len(df) < config.EMA_PERIOD + 10:
-        logger.warning("not enough candles")
+def run_strategy():
+    df = get_klines(config.SYMBOL, config.INTERVAL, limit=config.EMA_PERIOD * 3)
+    if df is None or len(df) < config.EMA_PERIOD + 5:
+        logger.warning("Not enough klines data")
         return
 
-    df['ema'] = df['c'].ewm(span=config.EMA_PERIOD, adjust=False).mean()
+    df['ema'] = df['close'].ewm(span=config.EMA_PERIOD, adjust=False).mean()
 
-    price = df['c'].iloc[-1]
-    ema   = df['ema'].iloc[-1]
+    price_now = df['close'].iloc[-1]
+    ema_now   = df['ema'].iloc[-1]
     daily_open = get_daily_open(config.SYMBOL)
 
     if daily_open is None:
         return
 
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    print(f"{now_str} | price {price:,.2f} | ema{config.EMA_PERIOD} {ema:,.2f} | open {daily_open:,.2f}")
-    logger.info(f"price {price:,.2f} | ema {ema:,.2f} | daily open {daily_open:,.2f}")
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    status = f"{ts} | Price {price_now:,.2f} | EMA{config.EMA_PERIOD} {ema_now:,.2f} | Open {daily_open:,.2f}"
+    print(status)
+    logger.info(status)
 
-    position = get_position(config.SYMBOL)
-    dist = abs(price - daily_open) / daily_open
+    pos_amt = get_position_amt(config.SYMBOL)
+    dist_to_open = abs(price_now - daily_open) / daily_open
+    usdt_avail = get_usdt_available()
 
-    usdt = get_usdt_available()
-
-    if usdt < config.MIN_SAFE_BALANCE:
-        if position != 0:
-            side = "SELL" if position > 0 else "BUY"
-            logger.critical(f"EMERGENCY CLOSE – balance too low {usdt:.2f}")
-            market_order(config.SYMBOL, side, abs(position))
+    if usdt_avail < config.MIN_SAFE_BALANCE and pos_amt != 0:
+        side = "SELL" if pos_amt > 0 else "BUY"
+        logger.critical(f"EMERGENCY FLATTEN – low balance {usdt_avail:.2f}")
+        place_market_order(config.SYMBOL, side, abs(pos_amt))
         return
 
-    # Entry / exit logic
-    if position == 0:
-        if price > ema and dist < config.DAILY_OPEN_TOLERANCE * 1.8 and price >= daily_open * (1 - config.DAILY_OPEN_TOLERANCE):
-            qty = (usdt * config.POSITION_PCT * config.LEVERAGE) / price
-            if qty > 0.001:
-                logger.info(f"LONG signal → qty ~ {qty:.3f}")
-                market_order(config.SYMBOL, "BUY", qty)
+    # Entry logic (flat position)
+    if pos_amt == 0:
+        if (price_now > ema_now and
+            dist_to_open <= config.DAILY_OPEN_TOLERANCE * 1.8 and
+            price_now >= daily_open * (1 - config.DAILY_OPEN_TOLERANCE)):
+            qty = (usdt_avail * config.POSITION_PCT * config.LEVERAGE) / price_now
+            if qty >= 0.001:
+                logger.info(f"LONG signal → qty ≈ {qty:.3f}")
+                place_market_order(config.SYMBOL, "BUY", qty)
 
-        elif price < ema and price <= daily_open * (1 - config.DAILY_OPEN_TOLERANCE):
-            qty = (usdt * config.POSITION_PCT * config.LEVERAGE) / price
-            if qty > 0.001:
-                logger.info(f"SHORT signal → qty ~ {qty:.3f}")
-                market_order(config.SYMBOL, "SELL", qty)
+        elif (price_now < ema_now and
+              price_now <= daily_open * (1 - config.DAILY_OPEN_TOLERANCE)):
+            qty = (usdt_avail * config.POSITION_PCT * config.LEVERAGE) / price_now
+            if qty >= 0.001:
+                logger.info(f"SHORT signal → qty ≈ {qty:.3f}")
+                place_market_order(config.SYMBOL, "SELL", qty)
 
-    elif position > 0 and price < ema * 0.988:
-        logger.info("close LONG")
-        market_order(config.SYMBOL, "SELL", abs(position))
+    # Exit logic
+    elif pos_amt > 0 and price_now < ema_now * 0.988:  # ~1.2% below EMA
+        logger.info("Close LONG triggered")
+        place_market_order(config.SYMBOL, "SELL", abs(pos_amt))
 
-    elif position < 0 and price > ema * 1.012:
-        logger.info("close SHORT")
-        market_order(config.SYMBOL, "BUY", abs(position))
+    elif pos_amt < 0 and price_now > ema_now * 1.012:  # ~1.2% above EMA
+        logger.info("Close SHORT triggered")
+        place_market_order(config.SYMBOL, "BUY", abs(pos_amt))
 
 
-# ─── Main loop ──────────────────────────────────────────────
+# ─── Main loop ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"Starting bot – {config.SYMBOL} {config.INTERVAL}  EMA{config.EMA_PERIOD}")
-    logger.info(f"Bot started – {config.SYMBOL}  live={config.RUN_LIVE}")
+    print(f"Bot starting → {config.SYMBOL} {config.INTERVAL} EMA({config.EMA_PERIOD})")
+    logger.info(f"Bot started – live={config.RUN_LIVE} symbol={config.SYMBOL}")
 
-    try:
-        client.change_leverage(symbol=config.SYMBOL, leverage=config.LEVERAGE)
-        print(f"Leverage set to {config.LEVERAGE}x")
-    except Exception as e:
-        if "2024" not in str(e):
-            print("leverage set warning:", e)
+    set_leverage(config.SYMBOL, config.LEVERAGE)
 
     while True:
         try:
-            run_once()
+            run_strategy()
         except KeyboardInterrupt:
             print("\nStopped by user.")
+            logger.info("Stopped by user")
             break
         except Exception as e:
-            logger.error(f"main loop error: {e}", exc_info=True)
-            print("error:", e)
+            logger.error(f"Unexpected loop error: {e}", exc_info=True)
+            print(f"Error: {e}")
 
         time.sleep(config.SLEEP_SECONDS)

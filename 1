@@ -167,11 +167,7 @@ def close_side(symbol, side: str, qty: float):
 
 def should_open_long(price: float, ema: float, daily_open: float) -> bool:
     dist = abs(price - daily_open) / daily_open
-    return (
-        price > ema and
-        dist <= config.DAILY_OPEN_TOLERANCE * 1.8 and
-        price >= daily_open * (1 - config.DAILY_OPEN_TOLERANCE)
-    )
+    return price > ema and
 
 
 def should_close_long(price: float, ema: float) -> bool:
@@ -179,7 +175,7 @@ def should_close_long(price: float, ema: float) -> bool:
 
 
 def should_open_short(price: float, ema: float, daily_open: float) -> bool:
-    return price < ema and price <= daily_open * (1 - config.DAILY_OPEN_TOLERANCE)
+    return price < ema
 
 
 def should_close_short(price: float, ema: float) -> bool:

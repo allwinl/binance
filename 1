@@ -1,6 +1,6 @@
 # bot.py
 # Simple EMA vs Daily Open strategy – Binance USDS-M Futures
-# Uses official binance-connector-python (UMFutures)
+# Uses official binance-sdk-derivatives-trading-usds-futures (v6.x)
 # All settings from config.py
 
 import time
@@ -9,10 +9,13 @@ from datetime import datetime
 import pandas as pd
 
 try:
-    from binance.um_futures import UMFutures
-    from binance.error import ClientError
+    from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
+    from binance_common.constants import (
+        DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL,
+        DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL
+    )
 except ImportError:
-    print("Install library first:")
+    print("Library import failed – make sure it's installed:")
     print("pip install binance-sdk-derivatives-trading-usds-futures")
     exit(1)
 
@@ -28,29 +31,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Client initialization ────────────────────────────────────────
-kwargs = {
-    "key": config.API_KEY,
-    "secret": config.API_SECRET,
+config_rest = {
+    "api_key": config.API_KEY,
+    "api_secret": config.API_SECRET,
 }
 
 if config.BASE_URL:
-    kwargs["base_url"] = config.BASE_URL
+    config_rest["base_path"] = config.BASE_URL
     print(">>> Using custom base URL (likely TESTNET) <<<")
     logger.info("Using custom base URL")
 else:
+    config_rest["base_path"] = DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
     print(">>> LIVE PRODUCTION MODE – REAL MONEY RISK! <<<")
     logger.warning("LIVE PRODUCTION MODE ACTIVE")
 
 if not config.RUN_LIVE:
     print("DRY RUN active – NO real orders will be placed!")
 
-client = UMFutures(**kwargs)
+client = DerivativesTradingUsdsFutures(config_rest_api=config_rest)
 
 # ─── Helper functions ─────────────────────────────────────────────
 
 def get_klines(symbol, interval, limit=300):
     try:
-        data = client.klines(symbol, interval, limit=limit)
+        data = client.rest_api.klines(symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(data, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qv', 'trades', 'taker_base', 'taker_quote', 'ignore'
@@ -59,52 +63,51 @@ def get_klines(symbol, interval, limit=300):
         for col in ['open', 'high', 'low', 'close']:
             df[col] = pd.to_numeric(df[col])
         return df
-    except ClientError as e:
-        logger.error(f"Klines error {e.error_code}: {e.error_message}")
+    except Exception as e:
+        logger.error(f"Klines error: {e}")
         return None
 
 
 def get_daily_open(symbol):
     try:
-        data = client.klines(symbol, "1d", limit=2)
-        return float(data[-1][1])  # open of current (possibly active) day
-    except ClientError as e:
-        logger.error(f"Daily open error {e.error_code}: {e.error_message}")
+        data = client.rest_api.klines(symbol=symbol, interval="1d", limit=2)
+        return float(data[-1][1])  # open of current day
+    except Exception as e:
+        logger.error(f"Daily open error: {e}")
         return None
 
 
 def get_position_amt(symbol):
     try:
-        pos = client.get_position_risk(symbol=symbol)
+        pos = client.rest_api.position_risk(symbol=symbol)
         if pos and len(pos) > 0:
             return float(pos[0]['positionAmt'])
         return 0.0
-    except ClientError as e:
-        logger.error(f"Position error {e.error_code}: {e.error_message}")
+    except Exception as e:
+        logger.error(f"Position error: {e}")
         return 0.0
 
 
 def get_usdt_available():
     try:
-        acc = client.account()
+        acc = client.rest_api.account()
         for asset in acc['assets']:
             if asset['asset'] == 'USDT':
                 return float(asset['availableBalance'])
         return 0.0
-    except ClientError as e:
-        logger.error(f"Balance error {e.error_code}: {e.error_message}")
+    except Exception as e:
+        logger.error(f"Balance error: {e}")
         return 0.0
 
 
 def set_leverage(symbol, lev):
     try:
-        client.change_leverage(symbol=symbol, leverage=lev)
+        client.rest_api.change_leverage(symbol=symbol, leverage=lev)
         msg = f"Leverage set to {lev}x"
         print(msg)
         logger.info(msg)
-    except ClientError as e:
-        if e.error_code != -2015:  # ignore "already set" style errors if common
-            logger.warning(f"Leverage set warning {e.error_code}: {e.error_message}")
+    except Exception as e:
+        logger.warning(f"Leverage set warning: {e}")
 
 
 def place_market_order(symbol, side, qty):
@@ -113,9 +116,9 @@ def place_market_order(symbol, side, qty):
         print(  f"DRY-RUN | would place {side} {qty:.3f} {symbol}")
         return None
 
-    qty = round(qty, 3)  # BTCUSDT typical — improve with exchangeInfo later
+    qty = round(qty, 3)  # BTCUSDT typical
     try:
-        order = client.new_order(
+        order = client.rest_api.new_order(
             symbol=symbol,
             side=side.upper(),
             type="MARKET",
@@ -125,9 +128,9 @@ def place_market_order(symbol, side, qty):
         print(msg)
         logger.info(msg)
         return order
-    except ClientError as e:
-        logger.error(f"Order failed {e.error_code}: {e.error_message}")
-        print(f"Order failed {e.error_code}: {e.error_message}")
+    except Exception as e:
+        logger.error(f"Order failed: {e}")
+        print(f"Order failed: {e}")
         return None
 
 
@@ -163,7 +166,7 @@ def run_strategy():
         place_market_order(config.SYMBOL, side, abs(pos_amt))
         return
 
-    # Entry logic (flat position)
+    # Entry logic (flat)
     if pos_amt == 0:
         if (price_now > ema_now and
             dist_to_open <= config.DAILY_OPEN_TOLERANCE * 1.8 and
@@ -181,11 +184,11 @@ def run_strategy():
                 place_market_order(config.SYMBOL, "SELL", qty)
 
     # Exit logic
-    elif pos_amt > 0 and price_now < ema_now * 0.988:  # ~1.2% below EMA
+    elif pos_amt > 0 and price_now < ema_now * 0.988:
         logger.info("Close LONG triggered")
         place_market_order(config.SYMBOL, "SELL", abs(pos_amt))
 
-    elif pos_amt < 0 and price_now > ema_now * 1.012:  # ~1.2% above EMA
+    elif pos_amt < 0 and price_now > ema_now * 1.012:
         logger.info("Close SHORT triggered")
         place_market_order(config.SYMBOL, "BUY", abs(pos_amt))
 

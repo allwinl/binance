@@ -1,54 +1,90 @@
-# bot_DIAGNOSTIC.py
-# PURPOSE: Verify position reading, open, close, hedge mode / positionSide work correctly
-# NO trading logic — just open → close → open opposite → close — repeatedly
-# Use VERY SMALL quantities only!
+# bot_DIAGNOSTIC.py - FIXED VERSION
+# PURPOSE: Test position reading, open, close, hedge mode on XRPUSDT
+# VERY SMALL SIZES – watch Binance interface closely
 
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone   # ← fixed import
+import traceback
 
 try:
     from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
 except ImportError:
     print("Cannot import DerivativesTradingUsdsFutures")
-    print("Make sure: pip install binance-sdk-derivatives-trading-usds-futures")
+    print("pip install binance-sdk-derivatives-trading-usds-futures")
     exit(1)
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
-SYMBOL          = "XRPUSDT"           # change if testing other pair
-TEST_QUANTITY   = 10               # VERY SMALL — adjust lower if needed
-LEVERAGE        = 5                   # low leverage for safety
-HEDGE_MODE      = True                # test both True and False
-SLEEP_SECONDS   = 60                  # time between actions
+SYMBOL          = "XRPUSDT"
+TEST_QUANTITY   = 10                     # your value – seems ok for XRP
+LEVERAGE        = 5
+HEDGE_MODE      = True
+SLEEP_SECONDS   = 60
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    filename='diagnostic_futures_bot.log',
+    filename='diagnostic_xrp.log',
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-5s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S UTC'
 )
 logger = logging.getLogger(__name__)
 
-# ─── Client ─────────────────────────────────────────────────────────────────
-client = DerivativesTradingUsdsFutures(
-    config_rest_api={
-        "api_key": "your_api_key_here",       # ← put real keys or import from config
-        "api_secret": "your_api_secret_here",
-        # For testnet (if SDK supports): add base_url or testnet param if available
-    }
-)
+# ─── Client Initialization – TRY DIFFERENT STYLES ───────────────────────────
+print("Trying to initialize client...")
 
-print(">>> DIAGNOSTIC MODE – VERY SMALL SIZES – WATCH CLOSELY <<<")
-print(f"Symbol: {SYMBOL} | Hedge mode: {HEDGE_MODE} | Quantity per trade: {TEST_QUANTITY}")
-logger.critical("DIAGNOSTIC BOT STARTED – SMALL SIZES – VERIFYING OPEN/CLOSE/HEDGE")
+client = None
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
+# Style 1 – most common in community SDKs
+try:
+    client = DerivativesTradingUsdsFutures(
+        api_key="your_api_key_here",          # ← replace or use config.API_KEY
+        api_secret="your_api_secret_here",
+        # base_url="https://fapi.binance.com"   # uncomment if needed for futures
+    )
+    print("Client initialized – Style 1 (direct api_key/api_secret)")
+except Exception as e:
+    print(f"Style 1 failed: {e}")
+
+# Style 2 – if it expects a credentials dict
+if client is None:
+    try:
+        client = DerivativesTradingUsdsFutures(
+            credentials={
+                "apiKey": "your_api_key_here",
+                "secret": "your_api_secret_here",
+            }
+        )
+        print("Client initialized – Style 2 (credentials dict)")
+    except Exception as e:
+        print(f"Style 2 failed: {e}")
+
+# Style 3 – if config_rest_api was wrong and it's just rest_api or similar
+if client is None:
+    try:
+        client = DerivativesTradingUsdsFutures(
+            rest_api={
+                "api_key": "your_api_key_here",
+                "api_secret": "your_api_secret_here",
+            }
+        )
+        print("Client initialized – Style 3 (rest_api dict)")
+    except Exception as e:
+        print(f"Style 3 failed: {e}")
+
+if client is None:
+    print("ALL initialization styles failed → check package docs or pip show binance-sdk-derivatives-trading-usds-futures")
+    exit(1)
+
+print(f"Client ready. Hedge mode target: {HEDGE_MODE}")
+logger.critical(f"DIAGNOSTIC START – {SYMBOL} – QTY={TEST_QUANTITY}")
+
+# ─── Helpers (with extra error printing) ────────────────────────────────────
 
 def get_position(symbol):
-    """ Returns tuple (long_qty, short_qty) """
     try:
         positions = client.rest_api.position_risk(symbol=symbol)
+        print("Raw position_risk response:", positions)  # ← debug
         if not positions:
             return 0.0, 0.0
 
@@ -57,7 +93,7 @@ def get_position(symbol):
 
         for pos in positions:
             side = pos.get('positionSide', 'BOTH')
-            amt = float(pos['positionAmt'])
+            amt = float(pos.get('positionAmt', 0))
             if side == 'LONG' or (side == 'BOTH' and amt > 0):
                 long_qty = amt
             elif side == 'SHORT' or (side == 'BOTH' and amt < 0):
@@ -65,29 +101,25 @@ def get_position(symbol):
 
         return long_qty, short_qty
     except Exception as e:
-        logger.error(f"position query failed: {e}")
-        print(f"position query failed: {e}")
+        print("position_risk FAILED:", str(e))
+        logger.error(f"position query failed: {e}\n{traceback.format_exc()}")
         return 0.0, 0.0
 
 
 def market_order(symbol, side: str, quantity: float, position_side: str = None):
-    if abs(quantity) < 0.0001:
-        print("Quantity too small – skipping")
-        return None
-
-    params = {
-        "symbol": symbol,
-        "side": side.upper(),
-        "type": "MARKET",
-        "quantity": quantity
-    }
-
-    if HEDGE_MODE and position_side:
-        params["positionSide"] = position_side.upper()
-
     try:
+        params = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": quantity
+        }
+        if HEDGE_MODE and position_side:
+            params["positionSide"] = position_side.upper()
+
+        print("Sending order params:", params)  # debug
         order = client.rest_api.new_order(**params)
-        msg = f"ORDER FILLED → {side.upper()} {quantity} {symbol}"
+        msg = f"ORDER → {side.upper()} {quantity} {symbol}"
         if position_side:
             msg += f" ({position_side})"
         msg += f"  ID: {order.get('orderId')}"
@@ -95,89 +127,79 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         logger.info(msg)
         return order
     except Exception as e:
-        logger.error(f"order failed: {e}")
-        print(f"order failed: {e}")
+        print("market_order FAILED:", str(e))
+        logger.error(f"order failed: {e}\n{traceback.format_exc()}")
         return None
 
 
 def close_side(symbol, side: str, qty: float):
     if abs(qty) < 0.0001:
-        print(f"No {side} position to close")
+        print(f"No {side} position")
         return None
-
     order_side = "SELL" if side == "LONG" else "BUY"
     qty_abs = abs(qty)
-    logger.info(f"Closing {side} → {order_side} {qty_abs}")
+    print(f"Closing {side} → {order_side} {qty_abs}")
     return market_order(symbol, order_side, qty_abs, position_side=side if HEDGE_MODE else None)
 
 
 def set_leverage(symbol, lev):
     try:
         client.rest_api.change_leverage(symbol=symbol, leverage=lev)
-        print(f"Leverage set to {lev}x")
-        logger.info(f"Leverage set to {lev}x")
+        print(f"Leverage → {lev}x OK")
+        logger.info(f"Leverage set {lev}x")
     except Exception as e:
-        if "2024" not in str(e):  # ignore "already set" error
-            logger.warning(f"leverage warning: {e}")
-            print(f"leverage warning: {e}")
+        print(f"leverage FAILED: {e}")
+        if "2024" not in str(e):
+            logger.warning(f"leverage: {e}")
 
 
-# ─── Diagnostic loop states ─────────────────────────────────────────────────
-STATE = "SHOW_STATUS"   # cycles: SHOW_STATUS → OPEN_LONG → CLOSE_LONG → OPEN_SHORT → CLOSE_SHORT → repeat
+# ─── Diagnostic cycle ───────────────────────────────────────────────────────
+STATE = "SHOW_STATUS"
+cycle_count = 0
 
-# ─── Main loop ──────────────────────────────────────────────────────────────
+while True:
+    cycle_count += 1
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")   # fixed
+    print(f"\n=== Cycle {cycle_count} – {now} ===")
 
-if __name__ == "__main__":
-    print(f"Starting DIAGNOSTIC bot → {SYMBOL}")
-    logger.critical(f"DIAGNOSTIC START – {SYMBOL} – SMALL TEST SIZES")
+    long_qty, short_qty = get_position(SYMBOL)
+    print(f"Position → LONG: {long_qty:.4f} | SHORT: {short_qty:.4f}")
 
-    set_leverage(SYMBOL, LEVERAGE)
+    if STATE == "SHOW_STATUS":
+        print("→ Showing status only...")
+        STATE = "OPEN_LONG"
 
-    cycle_count = 0
+    elif STATE == "OPEN_LONG":
+        if long_qty == 0 and short_qty == 0:
+            print("→ OPEN small LONG")
+            market_order(SYMBOL, "BUY", TEST_QUANTITY, "LONG" if HEDGE_MODE else None)
+        else:
+            print("→ Already positioned – skip open long")
+        STATE = "CLOSE_LONG"
 
-    while True:
-        cycle_count += 1
-        print(f"\n=== Cycle {cycle_count} – {datetime.utcnow():%Y-%m-%d %H:%M:%S UTC} ===")
+    elif STATE == "CLOSE_LONG":
+        if long_qty > 0.0001:
+            print("→ CLOSE LONG")
+            close_side(SYMBOL, "LONG", long_qty)
+        else:
+            print("→ No LONG open")
+        STATE = "OPEN_SHORT"
 
-        long_qty, short_qty = get_position(SYMBOL)
+    elif STATE == "OPEN_SHORT":
+        if long_qty == 0 and short_qty == 0:
+            print("→ OPEN small SHORT")
+            market_order(SYMBOL, "SELL", TEST_QUANTITY, "SHORT" if HEDGE_MODE else None)
+        else:
+            print("→ Already positioned – skip open short")
+        STATE = "CLOSE_SHORT"
 
-        print(f"Position:  LONG = {long_qty:.4f}   SHORT = {short_qty:.4f}")
+    elif STATE == "CLOSE_SHORT":
+        if short_qty < -0.0001:
+            print("→ CLOSE SHORT")
+            close_side(SYMBOL, "SHORT", short_qty)
+        else:
+            print("→ No SHORT open")
+        STATE = "SHOW_STATUS"   # back to start
 
-        if STATE == "SHOW_STATUS":
-            print("→ Just showing status...")
-            STATE = "OPEN_LONG"
-
-        elif STATE == "OPEN_LONG":
-            if long_qty == 0 and short_qty == 0:
-                print("→ Opening small LONG")
-                market_order(SYMBOL, "BUY", TEST_QUANTITY, "LONG" if HEDGE_MODE else None)
-            else:
-                print("→ Already in position – skipping open long")
-            STATE = "CLOSE_LONG"
-
-        elif STATE == "CLOSE_LONG":
-            if long_qty > 0.0001:
-                print("→ Closing LONG")
-                close_side(SYMBOL, "LONG", long_qty)
-            else:
-                print("→ No LONG to close")
-            STATE = "OPEN_SHORT"
-
-        elif STATE == "OPEN_SHORT":
-            if long_qty == 0 and short_qty == 0:
-                print("→ Opening small SHORT")
-                market_order(SYMBOL, "SELL", TEST_QUANTITY, "SHORT" if HEDGE_MODE else None)
-            else:
-                print("→ Already in position – skipping open short")
-            STATE = "CLOSE_SHORT"
-
-        elif STATE == "CLOSE_SHORT":
-            if short_qty < -0.0001:
-                print("→ Closing SHORT")
-                close_side(SYMBOL, "SHORT", short_qty)
-            else:
-                print("→ No SHORT to close")
-            STATE = "OPEN_LONG"  # loop back
-
-        print("───────────────────────────────────────")
-        time.sleep(SLEEP_SECONDS)
+    print("─" * 50)
+    time.sleep(SLEEP_SECONDS)

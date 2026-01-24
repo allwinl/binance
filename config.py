@@ -1,7 +1,7 @@
 # config.py   ── must be named exactly config.py
 
-API_KEY    = "your_key_here"
-API_SECRET = "your_secret_here"
+API_KEY = 'swNCkZLoqzFnYPreUDrFAAnoAxsx16PcJSDlU3AEpep7MwaOCVXzq3YHUDJkZvu8'
+
 
 SYMBOL               = "BTCUSDT"
 INTERVAL             = "1h"

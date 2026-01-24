@@ -39,42 +39,45 @@ configuration = ConfigurationRestAPI(
 
 client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
-# Debug: show available REST API methods (run once)
-print("\nDEBUG: Available methods on client.rest_api:")
-public_methods = [m for m in dir(client.rest_api) if not m.startswith('_') and callable(getattr(client.rest_api, m))]
-print(public_methods)
-print("Look for klines / kline / candles / get_klines / getKlines etc. and update code if needed.\n")
+# Optional debug: show available REST API methods (comment out after confirmation)
+# print("\nDEBUG: Available methods on client.rest_api:")
+# public_methods = [m for m in dir(client.rest_api) if not m.startswith('_') and callable(getattr(client.rest_api, m))]
+# print(public_methods)
+# print("───────────────────────────────────────────────\n")
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def get_klines(symbol, interval, limit=400):
     try:
-        # CHANGE THIS METHOD NAME based on debug output above
-        # Common alternatives: get_klines, kline, candles, getKlines, get_candles
-        resp = client.rest_api.get_klines(symbol=symbol, interval=interval, limit=limit)
+        # Using the correct method name from your SDK debug output
+        resp = client.rest_api.kline_candlestick_data(
+            symbol=symbol,
+            interval=interval,
+            limit=limit
+        )
         df = pd.DataFrame(resp, columns=[
-            'open_time','open','high','low','close','volume',
-            'close_time','quote_volume','trades','taker_base_volume',
-            'taker_quote_volume','ignore'
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'trades', 'taker_base_volume',
+            'taker_quote_volume', 'ignore'
         ])
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-        for col in ['open','high','low','close']:
+        for col in ['open', 'high', 'low', 'close']:
             df[col] = pd.to_numeric(df[col])
         return df
-    except AttributeError as ae:
-        logger.critical(f"klines method not found: {ae} – check debug list above")
-        print(f"klines method error: {ae} – see debug print")
-        return None
     except Exception as e:
-        logger.error(f"klines failed: {e}")
-        print(f"klines failed: {e}")
+        logger.error(f"kline_candlestick_data failed: {e}")
+        print(f"kline_candlestick_data failed: {e}")
         return None
 
 
 def get_daily_open(symbol):
     try:
-        resp = client.rest_api.get_klines(symbol=symbol, interval="1d", limit=2)  # same method name as above
-        return float(resp[-1][1])  # open price of current day
+        resp = client.rest_api.kline_candlestick_data(
+            symbol=symbol,
+            interval="1d",
+            limit=2
+        )
+        return float(resp[-1][1])  # open price of current (ongoing) daily candle
     except Exception as e:
         logger.error(f"daily open failed: {e}")
         return None
@@ -82,25 +85,29 @@ def get_daily_open(symbol):
 
 def get_position(symbol):
     try:
-        positions = client.rest_api.position_risk(symbol=symbol)  # may need get_position_risk or positionRisk
-        if not positions:
+        positions = client.rest_api.position_information_v3(symbol=symbol)  # v3 is usually more complete
+        # fallback to v2 if v3 fails
+    except:
+        try:
+            positions = client.rest_api.position_information_v2(symbol=symbol)
+        except Exception as e:
+            logger.error(f"position query failed: {e}")
             return 0.0, 0.0
 
-        long_qty = 0.0
-        short_qty = 0.0
+    long_qty = 0.0
+    short_qty = 0.0
 
+    if isinstance(positions, list):
         for pos in positions:
-            side = pos.get('positionSide', 'BOTH')
-            amt = float(pos.get('positionAmt', 0.0))
-            if side == 'LONG' or (side == 'BOTH' and amt > 0):
-                long_qty = amt
-            elif side == 'SHORT' or (side == 'BOTH' and amt < 0):
-                short_qty = amt
+            if pos.get('symbol') == symbol:
+                amt = float(pos.get('positionAmt', 0.0))
+                side = pos.get('positionSide', 'BOTH')
+                if side == 'LONG' or (side == 'BOTH' and amt > 0):
+                    long_qty = amt
+                elif side == 'SHORT' or (side == 'BOTH' and amt < 0):
+                    short_qty = amt
 
-        return long_qty, short_qty
-    except Exception as e:
-        logger.error(f"position query failed: {e}")
-        return 0.0, 0.0
+    return long_qty, short_qty
 
 
 def is_long(long_qty: float) -> bool:
@@ -113,7 +120,7 @@ def is_short(short_qty: float) -> bool:
 
 def get_usdt_balance():
     try:
-        account = client.rest_api.account()
+        account = client.rest_api.account_information_v3()  # or v2
         for asset in account.get('assets', []):
             if asset['asset'] == 'USDT':
                 return float(asset.get('availableBalance', 0.0))
@@ -125,10 +132,13 @@ def get_usdt_balance():
 
 def set_leverage(symbol, lev):
     try:
-        client.rest_api.change_leverage(symbol=symbol, leverage=lev)
+        client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
         logger.info(f"Leverage set → {lev}x")
     except Exception as e:
-        logger.warning(f"leverage set failed (may be already set): {e}")
+        if "already" in str(e).lower() or "2024" in str(e):
+            logger.info(f"Leverage already set to {lev}x")
+        else:
+            logger.warning(f"leverage warning: {e}")
 
 
 def market_order(symbol, side: str, quantity: float, position_side: str = None):
@@ -141,7 +151,7 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         "side": side.upper(),
         "type": "MARKET",
         "quantity": quantity,
-        "newOrderRespType": "RESULT"  # for fill details
+        "newOrderRespType": "RESULT"
     }
 
     if config.HEDGE_MODE and position_side:

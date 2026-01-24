@@ -1,11 +1,11 @@
-# bot.py
-# Binance USDS-M Futures bot – EMA(21) on 1h vs daily open – LIVE VERSION
-# All settings come from config.py
+# bot_DIAGNOSTIC.py
+# PURPOSE: Verify position reading, open, close, hedge mode / positionSide work correctly
+# NO trading logic — just open → close → open opposite → close — repeatedly
+# Use VERY SMALL quantities only!
 
 import time
 import logging
 from datetime import datetime
-import pandas as pd
 
 try:
     from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
@@ -14,61 +14,36 @@ except ImportError:
     print("Make sure: pip install binance-sdk-derivatives-trading-usds-futures")
     exit(1)
 
-import config
-
-# ─── Configuration ──────────────────────────────────────────────────────────
-HEDGE_MODE = True           # ← Set to False to use One-way Mode (Both)
-                            # Must close all positions/orders before switching
+# ─── CONFIG ─────────────────────────────────────────────────────────────────
+SYMBOL          = "XRPUSDT"           # change if testing other pair
+TEST_QUANTITY   = 10               # VERY SMALL — adjust lower if needed
+LEVERAGE        = 5                   # low leverage for safety
+HEDGE_MODE      = True                # test both True and False
+SLEEP_SECONDS   = 60                  # time between actions
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    filename='live_futures_bot.log',
+    filename='diagnostic_futures_bot.log',
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-5s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S UTC'
 )
 logger = logging.getLogger(__name__)
 
-# ─── Client (production / real money) ───────────────────────────────────────
+# ─── Client ─────────────────────────────────────────────────────────────────
 client = DerivativesTradingUsdsFutures(
     config_rest_api={
-        "api_key": config.API_KEY,
-        "api_secret": config.API_SECRET,
-        # no base_path → production (real money)
+        "api_key": "your_api_key_here",       # ← put real keys or import from config
+        "api_secret": "your_api_secret_here",
+        # For testnet (if SDK supports): add base_url or testnet param if available
     }
 )
 
-print(">>> LIVE MODE – REAL MONEY – EXTREME CAUTION <<<")
-logger.critical("BOT STARTED IN LIVE MODE – REAL MONEY AT RISK")
-print(f"Mode: {'HEDGE' if HEDGE_MODE else 'ONE-WAY (Both)'}")
+print(">>> DIAGNOSTIC MODE – VERY SMALL SIZES – WATCH CLOSELY <<<")
+print(f"Symbol: {SYMBOL} | Hedge mode: {HEDGE_MODE} | Quantity per trade: {TEST_QUANTITY}")
+logger.critical("DIAGNOSTIC BOT STARTED – SMALL SIZES – VERIFYING OPEN/CLOSE/HEDGE")
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
-
-def get_klines(symbol, interval, limit=400):
-    try:
-        resp = client.rest_api.klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(resp, columns=[
-            'open_time','open','high','low','close','volume',
-            'close_time','quote_volume','trades','taker_base_volume',
-            'taker_quote_volume','ignore'
-        ])
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-        for col in ['open','high','low','close']:
-            df[col] = pd.to_numeric(df[col])
-        return df
-    except Exception as e:
-        logger.error(f"klines failed: {e}")
-        return None
-
-
-def get_daily_open(symbol):
-    try:
-        resp = client.rest_api.klines(symbol=symbol, interval="1d", limit=2)
-        return float(resp[-1][1])  # open price of current (ongoing) daily candle
-    except Exception as e:
-        logger.error(f"daily open failed: {e}")
-        return None
-
 
 def get_position(symbol):
     """ Returns tuple (long_qty, short_qty) """
@@ -91,43 +66,15 @@ def get_position(symbol):
         return long_qty, short_qty
     except Exception as e:
         logger.error(f"position query failed: {e}")
+        print(f"position query failed: {e}")
         return 0.0, 0.0
 
 
-def is_long(long_qty: float) -> bool:
-    return long_qty > 0.0001
-
-
-def is_short(short_qty: float) -> bool:
-    return short_qty < -0.0001
-
-
-def get_usdt_balance():
-    try:
-        account = client.rest_api.account()
-        for asset in account['assets']:
-            if asset['asset'] == 'USDT':
-                return float(asset['availableBalance'])
-        return 0.0
-    except Exception as e:
-        logger.error(f"balance query failed: {e}")
-        return 0.0
-
-
-def set_leverage(symbol, lev):
-    try:
-        client.rest_api.change_leverage(symbol=symbol, leverage=lev)
-        logger.info(f"Leverage set → {lev}x")
-    except Exception as e:
-        if "2024" not in str(e):  # already set
-            logger.warning(f"leverage change warning: {e}")
-
-
 def market_order(symbol, side: str, quantity: float, position_side: str = None):
-    if abs(quantity) < 0.0005:
+    if abs(quantity) < 0.0001:
+        print("Quantity too small – skipping")
         return None
 
-    quantity = round(quantity, 3)
     params = {
         "symbol": symbol,
         "side": side.upper(),
@@ -136,11 +83,11 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
     }
 
     if HEDGE_MODE and position_side:
-        params["positionSide"] = position_side.upper()  # LONG or SHORT
+        params["positionSide"] = position_side.upper()
 
     try:
         order = client.rest_api.new_order(**params)
-        msg = f"ORDER FILLED → {side.upper()} {quantity:.3f} {symbol}"
+        msg = f"ORDER FILLED → {side.upper()} {quantity} {symbol}"
         if position_side:
             msg += f" ({position_side})"
         msg += f"  ID: {order.get('orderId')}"
@@ -154,124 +101,83 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
 
 
 def close_side(symbol, side: str, qty: float):
-    if abs(qty) < 0.0005:
+    if abs(qty) < 0.0001:
+        print(f"No {side} position to close")
         return None
 
     order_side = "SELL" if side == "LONG" else "BUY"
     qty_abs = abs(qty)
-    logger.info(f"Closing {side} → {order_side} {qty_abs:.3f}")
+    logger.info(f"Closing {side} → {order_side} {qty_abs}")
     return market_order(symbol, order_side, qty_abs, position_side=side if HEDGE_MODE else None)
 
 
-# ─── Strategy Logic ─────────────────────────────────────────────────────────
-
-def should_open_long(price: float, ema: float, daily_open: float) -> bool:
-    dist = abs(price - daily_open) / daily_open
-    return price > ema
-
-
-def should_close_long(price: float, ema: float) -> bool:
-    return price < ema * 0.988
-
-
-def should_open_short(price: float, ema: float, daily_open: float) -> bool:
-    return price < ema
+def set_leverage(symbol, lev):
+    try:
+        client.rest_api.change_leverage(symbol=symbol, leverage=lev)
+        print(f"Leverage set to {lev}x")
+        logger.info(f"Leverage set to {lev}x")
+    except Exception as e:
+        if "2024" not in str(e):  # ignore "already set" error
+            logger.warning(f"leverage warning: {e}")
+            print(f"leverage warning: {e}")
 
 
-def should_close_short(price: float, ema: float) -> bool:
-    return price > ema * 1.012
-
-
-def calculate_quantity(usdt: float, price: float) -> float:
-    risk_usdt = usdt * config.POSITION_PCT
-    qty = (risk_usdt * config.LEVERAGE) / price
-    return round(qty, 3)
-
-
-# ─── Main decision function ────────────────────────────────────────────────
-
-def run_once():
-    df = get_klines(config.SYMBOL, config.INTERVAL, limit=config.EMA_PERIOD * 4)
-    if df is None or len(df) < config.EMA_PERIOD + 30:
-        logger.warning("not enough candles → skipping")
-        return
-
-    df['ema'] = df['close'].ewm(span=config.EMA_PERIOD, adjust=False).mean()
-
-    price       = float(df['close'].iloc[-1])
-    ema         = float(df['ema'].iloc[-1])
-    daily_open  = get_daily_open(config.SYMBOL)
-
-    if daily_open is None:
-        return
-
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    print(f"{now_str} | price {price:,.2f} | ema{config.EMA_PERIOD} {ema:,.2f} | daily open {daily_open:,.2f}")
-    logger.info(f"price {price:,.2f} | ema {ema:,.2f} | open {daily_open:,.2f}")
-
-    long_qty, short_qty = get_position(config.SYMBOL)
-    usdt = get_usdt_balance()
-
-    # Emergency safety net
-    if usdt < config.MIN_SAFE_BALANCE and (long_qty != 0 or short_qty != 0):
-        logger.critical(f"EMERGENCY CLOSE – low balance {usdt:.2f} USDT")
-        if long_qty != 0:
-            close_side(config.SYMBOL, "LONG", long_qty)
-        if short_qty != 0:
-            close_side(config.SYMBOL, "SHORT", short_qty)
-        return
-
-    # ─── Position handling ──────────────────────────────────────────────
-
-    # Close logic (can happen even if we plan to reverse later)
-    if is_long(long_qty) and should_close_long(price, ema):
-        logger.info("CLOSE LONG signal")
-        close_side(config.SYMBOL, "LONG", long_qty)
-
-    if is_short(short_qty) and should_close_short(price, ema):
-        logger.info("CLOSE SHORT signal")
-        close_side(config.SYMBOL, "SHORT", short_qty)
-
-    # Entry logic – only when the opposite side is not open (prevents double direction in one-way)
-    # In Hedge mode you could remove the "not is_xxx" checks if you want true hedging
-    if not is_long(long_qty) and should_open_long(price, ema, daily_open):
-        qty = calculate_quantity(usdt, price)
-        if qty >= 0.001:
-            logger.info(f"OPEN LONG signal → qty {qty:.3f}")
-            market_order(config.SYMBOL, "BUY", qty, position_side="LONG" if HEDGE_MODE else None)
-
-    if not is_short(short_qty) and should_open_short(price, ema, daily_open):
-        qty = calculate_quantity(usdt, price)
-        if qty >= 0.001:
-            logger.info(f"OPEN SHORT signal → qty {qty:.3f}")
-            market_order(config.SYMBOL, "SELL", qty, position_side="SHORT" if HEDGE_MODE else None)
-
+# ─── Diagnostic loop states ─────────────────────────────────────────────────
+STATE = "SHOW_STATUS"   # cycles: SHOW_STATUS → OPEN_LONG → CLOSE_LONG → OPEN_SHORT → CLOSE_SHORT → repeat
 
 # ─── Main loop ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"Starting LIVE bot → {config.SYMBOL} {config.INTERVAL} EMA({config.EMA_PERIOD})")
-    logger.critical(f"LIVE BOT STARTED – {config.SYMBOL} – REAL MONEY")
+    print(f"Starting DIAGNOSTIC bot → {SYMBOL}")
+    logger.critical(f"DIAGNOSTIC START – {SYMBOL} – SMALL TEST SIZES")
 
-    set_leverage(config.SYMBOL, config.LEVERAGE)
+    set_leverage(SYMBOL, LEVERAGE)
 
-    # Optional: set hedge mode once (comment out after first run if needed)
-    # try:
-    #     dual = "true" if HEDGE_MODE else "false"
-    #     client.rest_api.change_position_mode(dualSidePosition=dual)
-    #     logger.info(f"Position mode set to {'Hedge' if HEDGE_MODE else 'One-way'}")
-    # except Exception as e:
-    #     logger.warning(f"Could not set position mode: {e} (already set?)")
+    cycle_count = 0
 
     while True:
-        try:
-            run_once()
-        except KeyboardInterrupt:
-            print("\nStopped by user.")
-            logger.info("Stopped by user")
-            break
-        except Exception as e:
-            logger.critical(f"MAIN LOOP ERROR: {e}", exc_info=True)
-            print(f"CRITICAL ERROR: {e}")
+        cycle_count += 1
+        print(f"\n=== Cycle {cycle_count} – {datetime.utcnow():%Y-%m-%d %H:%M:%S UTC} ===")
 
-        time.sleep(config.SLEEP_SECONDS)
+        long_qty, short_qty = get_position(SYMBOL)
+
+        print(f"Position:  LONG = {long_qty:.4f}   SHORT = {short_qty:.4f}")
+
+        if STATE == "SHOW_STATUS":
+            print("→ Just showing status...")
+            STATE = "OPEN_LONG"
+
+        elif STATE == "OPEN_LONG":
+            if long_qty == 0 and short_qty == 0:
+                print("→ Opening small LONG")
+                market_order(SYMBOL, "BUY", TEST_QUANTITY, "LONG" if HEDGE_MODE else None)
+            else:
+                print("→ Already in position – skipping open long")
+            STATE = "CLOSE_LONG"
+
+        elif STATE == "CLOSE_LONG":
+            if long_qty > 0.0001:
+                print("→ Closing LONG")
+                close_side(SYMBOL, "LONG", long_qty)
+            else:
+                print("→ No LONG to close")
+            STATE = "OPEN_SHORT"
+
+        elif STATE == "OPEN_SHORT":
+            if long_qty == 0 and short_qty == 0:
+                print("→ Opening small SHORT")
+                market_order(SYMBOL, "SELL", TEST_QUANTITY, "SHORT" if HEDGE_MODE else None)
+            else:
+                print("→ Already in position – skipping open short")
+            STATE = "CLOSE_SHORT"
+
+        elif STATE == "CLOSE_SHORT":
+            if short_qty < -0.0001:
+                print("→ Closing SHORT")
+                close_side(SYMBOL, "SHORT", short_qty)
+            else:
+                print("→ No SHORT to close")
+            STATE = "OPEN_LONG"  # loop back
+
+        print("───────────────────────────────────────")
+        time.sleep(SLEEP_SECONDS)

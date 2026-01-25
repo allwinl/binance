@@ -1,5 +1,6 @@
 # bot.py
-# Binance USDS-M Futures bot – EMA(21) on 1h vs daily open – IMPROVED LIVE VERSION
+# Binance USDS-M Futures bot – EMA(21) on 15m vs daily open – IMPROVED LIVE VERSION
+# Uses python-binance for clean klines fetching + official SDK for trading
 # REAL PRODUCTION – EXTREME CAUTION – Jan 2026
 
 import time
@@ -7,16 +8,25 @@ import logging
 from datetime import datetime
 import pandas as pd
 
+# ─── Official SDK (for trading / account) ───────────────────────────────────
 try:
     from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
     from binance_common.configuration import ConfigurationRestAPI
     from binance_common.constants import DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
 except ImportError:
-    print("Missing packages – install:")
-    print("pip install binance-sdk-derivatives-trading-usds-futures binance-common pandas")
+    print("Missing official SDK packages")
+    print("pip install binance-sdk-derivatives-trading-usds-futures binance-common")
     exit(1)
 
-import config  # your config.py with API_KEY, API_SECRET, SYMBOL="BTCUSDT", INTERVAL="1h", etc.
+# ─── python-binance for clean klines ────────────────────────────────────────
+try:
+    from binance.client import Client as BinanceClient
+except ImportError:
+    print("Missing python-binance")
+    print("pip install python-binance")
+    exit(1)
+
+import config  # your config.py with API_KEY, API_SECRET, SYMBOL="BTCUSDT", INTERVAL="15m", etc.
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -27,108 +37,78 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Client (production) ────────────────────────────────────────────────────
+# ─── Clients ────────────────────────────────────────────────────────────────
 print(">>> LIVE MODE – REAL MONEY – EXTREME CAUTION <<<")
 logger.critical("BOT STARTED IN LIVE MODE – REAL MONEY AT RISK")
 
+# Official SDK client (trading)
 configuration = ConfigurationRestAPI(
     api_key=config.API_KEY,
     api_secret=config.API_SECRET,
     base_path=DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
 )
+trading_client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
-client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
+# python-binance client (market data – no secret needed for public endpoints)
+market_client = BinanceClient()  # public only – add api_key/api_secret if using private later
 
 # ─── Configurable constants ─────────────────────────────────────────────────
-STOP_LOSS_PCT = 0.035           # 3.5% below/above entry
+STOP_LOSS_PCT = 0.035
 MIN_NOTIONAL_USDT = 5.0
-QTY_ROUND_DECIMALS = 3          # BTCUSDT typically 3
+QTY_ROUND_DECIMALS = 3
 PRICE_ROUND_DECIMALS = 1
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
+# ─── Market Data Helpers (using python-binance – clean & reliable) ──────────
 
-def get_klines(symbol, interval, limit=500, start_time=None, end_time=None):
+def get_historical_data(symbol, interval, limit=400):
+    """Like your reference: fetch OHLCV and return DataFrame"""
     try:
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        }
-        if start_time:
-            params["startTime"] = start_time
-        if end_time:
-            params["endTime"] = end_time
-
-        logger.debug(f"Fetching klines: {params}")
-
-        resp = client.rest_api.kline_candlestick_data(**params)
-
-        # ─── Robust Binance futures response handling ──────────────────────
-        if isinstance(resp, dict):
-            if 'code' in resp and 'msg' in resp:
-                raise ValueError(f"Binance API error {resp['code']}: {resp['msg']}")
-            elif 'data' in resp and isinstance(resp['data'], list):
-                candles = resp['data']   # in case SDK sometimes wraps
-            else:
-                raise ValueError(f"Unexpected dict response: {list(resp.keys())}")
-
-        elif isinstance(resp, list):
-            candles = resp               # ← this is the normal success case for /fapi/v1/klines
-
-        elif resp is None:
-            raise ValueError("SDK returned None")
-
-        else:
-            raise ValueError(f"Unexpected response type: {type(resp)}")
-
-        if not candles:
-            logger.warning(f"Empty klines for {symbol} {interval} limit={limit}")
-            return None
-
-        df = pd.DataFrame(candles, columns=[
+        ohlcv = market_client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_base_volume',
-            'taker_quote_volume', 'ignore'
+            'close_time', 'quote_volume', 'trades', 'taker_base', 'taker_quote', 'ignore'
         ])
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
         numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume']
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-
+        df.set_index('open_time', inplace=True)
         return df.dropna(subset=['close'])
-
     except Exception as e:
-        logger.error(f"klines failed: {e}", exc_info=True)
+        logger.error(f"fetch_ohlcv failed: {e}")
         print(f"klines ERROR: {e}")
         return None
 
 
 def get_daily_open(symbol):
+    """Get today's open or previous close as fallback"""
     try:
-        df = get_klines(symbol, "1d", limit=3)
+        df = get_historical_data(symbol, '1d', limit=3)
         if df is None or len(df) < 1:
             return None
 
         now = pd.Timestamp.utcnow()
-        today_start = now.floor('D')   # midnight UTC
+        today_midnight = now.floor('D')
 
-        today_candle = df[df['open_time'] == today_start]
-        if not today_candle.empty:
-            return float(today_candle.iloc[0]['open'])
-
-        # Fallback: previous complete day
-        return float(df.iloc[-2]['open'])
+        if df.index[ -1 ] >= today_midnight:
+            # Current day candle exists → use its open
+            return float(df['open'].iloc[-1])
+        else:
+            # Use previous day close
+            return float(df['close'].iloc[-1])
 
     except Exception as e:
         logger.error(f"daily open failed: {e}")
         return None
 
 
+# ─── Trading Helpers (using official SDK) ───────────────────────────────────
+
 def get_position(symbol):
     try:
-        positions = client.rest_api.position_information_v3(symbol=symbol)
+        positions = trading_client.rest_api.position_information_v3(symbol=symbol)
     except Exception:
         try:
-            positions = client.rest_api.position_information_v2(symbol=symbol)
+            positions = trading_client.rest_api.position_information_v2(symbol=symbol)
         except Exception as e:
             logger.error(f"position query failed: {e}")
             return 0.0, 0.0
@@ -139,49 +119,43 @@ def get_position(symbol):
     if isinstance(positions, list):
         for pos in positions:
             if pos.get('symbol') == symbol:
-                amt_str = pos.get('positionAmt', '0')
-                amt = float(amt_str) if amt_str else 0.0
+                amt = float(pos.get('positionAmt', '0'))
                 side = pos.get('positionSide', 'BOTH')
-                if side == 'LONG' or (side == 'BOTH' and amt > 0):
+                if side in ('LONG', 'BOTH') and amt > 0:
                     long_qty = amt
-                elif side == 'SHORT' or (side == 'BOTH' and amt < 0):
+                elif side in ('SHORT', 'BOTH') and amt < 0:
                     short_qty = amt
 
     return long_qty, short_qty
 
 
-def is_long(long_qty: float) -> bool:
-    return long_qty > 1e-4
-
-
-def is_short(short_qty: float) -> bool:
-    return short_qty < -1e-4
+def is_long(qty): return qty > 1e-4
+def is_short(qty): return qty < -1e-4
 
 
 def get_usdt_balance():
     try:
-        account = client.rest_api.account_information_v3()
+        account = trading_client.rest_api.account_information_v3()
         for asset in account.get('assets', []):
             if asset.get('asset') == 'USDT':
                 return float(asset.get('availableBalance', 0.0))
         return 0.0
     except Exception as e:
-        logger.error(f"balance query failed: {e}")
+        logger.error(f"balance failed: {e}")
         return 0.0
 
 
 def set_leverage(symbol, lev):
     try:
-        client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
-        logger.info(f"Leverage set → {lev}x")
+        trading_client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
+        logger.info(f"Leverage set to {lev}x")
     except Exception as e:
-        logger.warning(f"Leverage set failed (may already be set): {e}")
+        logger.warning(f"Leverage set failed (maybe already set): {e}")
 
 
 def market_order(symbol, side: str, quantity: float, position_side: str = None):
     if abs(quantity) < 0.0005:
         return None
-
     qty = round(quantity, QTY_ROUND_DECIMALS)
     if qty <= 0:
         return None
@@ -197,11 +171,11 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         params["positionSide"] = position_side.upper()
 
     try:
-        order = client.rest_api.new_order(**params)
+        order = trading_client.rest_api.new_order(**params)
         msg = f"ORDER FILLED → {side.upper()} {qty:.3f} {symbol}"
         if position_side:
             msg += f" ({position_side})"
-        msg += f"  ID: {order.get('orderId')}"
+        msg += f" ID: {order.get('orderId')}"
         print(msg)
         logger.info(msg)
         return order
@@ -213,15 +187,13 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
 
 def place_protective_stop(symbol, side: str, qty: float, entry_price: float):
     if side.upper() == "LONG":
-        stop_price = entry_price * (1 - STOP_LOSS_PCT)
+        stop_price = round(entry_price * (1 - STOP_LOSS_PCT), PRICE_ROUND_DECIMALS)
         stop_side = "SELL"
         pos_side = "LONG"
     else:
-        stop_price = entry_price * (1 + STOP_LOSS_PCT)
+        stop_price = round(entry_price * (1 + STOP_LOSS_PCT), PRICE_ROUND_DECIMALS)
         stop_side = "BUY"
         pos_side = "SHORT"
-
-    stop_price = round(stop_price, PRICE_ROUND_DECIMALS)
 
     params = {
         "symbol": symbol,
@@ -235,10 +207,10 @@ def place_protective_stop(symbol, side: str, qty: float, entry_price: float):
         params["positionSide"] = pos_side
 
     try:
-        order = client.rest_api.new_order(**params)
-        logger.info(f"STOP placed @ {stop_price:,.{PRICE_ROUND_DECIMALS}f} ({side}) ID: {order.get('orderId')}")
+        order = trading_client.rest_api.new_order(**params)
+        logger.info(f"STOP placed @ {stop_price} ({side}) ID: {order.get('orderId')}")
     except Exception as e:
-        logger.critical(f"!!! STOP PLACEMENT FAILED !!! POSITION UNPROTECTED: {e}")
+        logger.critical(f"STOP PLACEMENT FAILED – DANGER: {e}")
 
 
 def close_side(symbol, side: str, qty: float):
@@ -250,7 +222,7 @@ def close_side(symbol, side: str, qty: float):
     return market_order(symbol, order_side, qty_abs, side if config.HEDGE_MODE else None)
 
 
-# ─── Strategy logic ─────────────────────────────────────────────────────────
+# ─── Strategy ───────────────────────────────────────────────────────────────
 
 def should_open_long(price: float, ema: float, daily_open: float) -> bool:
     return price > ema
@@ -274,14 +246,14 @@ def calculate_quantity(usdt: float, price: float) -> float:
     risk_usdt = usdt * config.POSITION_PCT
     notional = risk_usdt * config.LEVERAGE
     if notional < MIN_NOTIONAL_USDT:
-        logger.warning(f"Notional too small {notional:.2f} < {MIN_NOTIONAL_USDT}")
+        logger.warning(f"Notional too small {notional:.2f}")
         return 0.0
     return notional / price
 
 
 def run_once():
-    df = get_klines(config.SYMBOL, config.INTERVAL, limit=config.EMA_PERIOD * 4)
-    if df is None or len(df) < config.EMA_PERIOD + 30:
+    df = get_historical_data(config.SYMBOL, config.INTERVAL, limit=config.EMA_PERIOD * 4)
+    if df is None or len(df) < config.EMA_PERIOD + 10:
         logger.warning("Not enough candles")
         return
 
@@ -292,11 +264,11 @@ def run_once():
     daily_open = get_daily_open(config.SYMBOL)
 
     if daily_open is None:
-        logger.warning("No daily open available")
+        logger.warning("No daily open")
         return
 
     ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-    print(f"{ts} | price {price:,.2f} | EMA{config.EMA_PERIOD} {ema:,.2f} | daily open {daily_open:,.2f}")
+    print(f"{ts} | price {price:,.2f} | EMA{config.EMA_PERIOD} ({config.INTERVAL}) {ema:,.2f} | daily open {daily_open:,.2f}")
     logger.info(f"price {price:,.2f} | ema {ema:,.2f} | open {daily_open:,.2f}")
 
     long_qty, short_qty = get_position(config.SYMBOL)
@@ -304,13 +276,11 @@ def run_once():
 
     if usdt < config.MIN_SAFE_BALANCE and (abs(long_qty) > 1e-4 or abs(short_qty) > 1e-4):
         logger.critical(f"EMERGENCY CLOSE – low balance {usdt:.2f}")
-        if long_qty != 0:
-            close_side(config.SYMBOL, "LONG", long_qty)
-        if short_qty != 0:
-            close_side(config.SYMBOL, "SHORT", short_qty)
+        if long_qty: close_side(config.SYMBOL, "LONG", long_qty)
+        if short_qty: close_side(config.SYMBOL, "SHORT", short_qty)
         return
 
-    # Close positions
+    # Close
     if is_long(long_qty) and should_close_long(price, ema):
         logger.info("Closing LONG")
         close_side(config.SYMBOL, "LONG", long_qty)
@@ -319,7 +289,7 @@ def run_once():
         logger.info("Closing SHORT")
         close_side(config.SYMBOL, "SHORT", short_qty)
 
-    # Open new positions
+    # Open
     if not is_long(long_qty) and should_open_long(price, ema, daily_open):
         qty = calculate_quantity(usdt, price)
         if qty >= 0.001:
@@ -337,7 +307,7 @@ def run_once():
                 place_protective_stop(config.SYMBOL, "SHORT", qty, float(order['avgPrice']))
 
 
-# ─── Main loop ──────────────────────────────────────────────────────────────
+# ─── Main ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print(f"Starting LIVE bot → {config.SYMBOL} {config.INTERVAL} EMA({config.EMA_PERIOD})")
@@ -355,6 +325,6 @@ if __name__ == "__main__":
         except Exception as e:
             logger.critical(f"MAIN LOOP ERROR: {e}", exc_info=True)
             print(f"CRITICAL: {e}")
-            time.sleep(30)  # backoff on error
+            time.sleep(30)
 
         time.sleep(config.SLEEP_SECONDS)

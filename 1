@@ -1,5 +1,5 @@
 # bot.py
-# Binance USDS-M Futures bot – EMA(21) on 1h vs daily open – LIVE VERSION
+# Binance USDS-M Futures bot – EMA(21) on 1h vs daily open – LIVE VERSION (improved 2026)
 # REAL PRODUCTION – EXTREME CAUTION
 
 import time
@@ -39,31 +39,43 @@ configuration = ConfigurationRestAPI(
 
 client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
+# ─── Configurable constants (move to config.py if preferred) ───────────────
+STOP_LOSS_PCT = 0.035          # 3.5% stop loss example
+MIN_NOTIONAL_USDT = 5.0        # rough minimum notional value
+QTY_ROUND_DECIMALS = 3         # adjust per symbol (BTCUSDT usually 3)
+PRICE_ROUND_DECIMALS = 1       # BTCUSDT usually 1 or 2
+
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def get_klines(symbol, interval, limit=400):
     try:
+        logger.debug(f"Requesting klines: {symbol} {interval} limit={limit}")
         resp = client.rest_api.kline_candlestick_data(
             symbol=symbol,
             interval=interval,
             limit=limit
         )
 
-        # Handle wrapped response (common in SDKs)
-        if isinstance(resp, dict):
-            if 'data' in resp:
+        # ─── Robust response handling ──────────────────────────────────────
+        if isinstance(resp, list):
+            candles = resp
+        elif isinstance(resp, dict):
+            if 'data' in resp and isinstance(resp['data'], list):
                 candles = resp['data']
-            elif 'result' in resp:
+            elif 'result' in resp and isinstance(resp['result'], list):
                 candles = resp['result']
-            elif 'klines' in resp:
-                candles = resp['klines']
+            elif 'code' in resp and 'msg' in resp:
+                raise ValueError(f"Binance API error {resp['code']}: {resp['msg']}")
             else:
-                raise ValueError("No recognizable candle data in response")
+                raise ValueError(f"Unexpected dict format: {resp.keys()}")
+        elif resp is None:
+            raise ValueError("SDK returned None for klines request")
         else:
-            candles = resp  # assume it's already the list
+            raise ValueError(f"Unexpected response type: {type(resp)}")
 
-        if not isinstance(candles, list) or not candles:
-            raise ValueError("Candles data is empty or not a list")
+        if not candles:
+            logger.warning(f"No candles returned for {symbol} {interval}")
+            return None
 
         df = pd.DataFrame(candles, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -74,40 +86,33 @@ def get_klines(symbol, interval, limit=400):
         for col in ['open', 'high', 'low', 'close', 'volume', 'quote_volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        return df
+        return df.dropna(subset=['close'])
+
     except Exception as e:
-        logger.error(f"kline_candlestick_data failed: {e}")
-        print(f"kline_candlestick_data failed: {e}")
+        logger.error(f"kline_candlestick_data failed: {e}", exc_info=True)
+        print(f"ERROR: kline fetch failed → {e}")
         return None
 
 
 def get_daily_open(symbol):
     try:
-        resp = client.rest_api.kline_candlestick_data(
-            symbol=symbol,
-            interval="1d",
-            limit=2
-        )
-
-        # Same unwrapping logic
-        if isinstance(resp, dict):
-            if 'data' in resp:
-                candles = resp['data']
-            elif 'result' in resp:
-                candles = resp['result']
-            elif 'klines' in resp:
-                candles = resp['klines']
-            else:
-                raise ValueError("No recognizable candle data in response")
-        else:
-            candles = resp
-
-        if not candles or len(candles) < 1:
+        df = get_klines(symbol, "1d", limit=3)
+        if df is None or len(df) < 1:
             return None
 
-        return float(candles[-1][1])  # open price of most recent candle
+        now = pd.Timestamp.utcnow()
+        today_start = now.normalize()
+
+        # Try to find today's candle
+        today_candle = df[df['open_time'].dt.normalize() == today_start]
+        if not today_candle.empty:
+            return float(today_candle.iloc[0]['open'])
+
+        # Fallback: most recent **complete** daily candle
+        return float(df.iloc[-2]['open'])  # -1 is current (possibly incomplete)
+
     except Exception as e:
-        logger.error(f"daily open failed: {e}")
+        logger.error(f"Failed to get daily open: {e}")
         return None
 
 
@@ -127,7 +132,7 @@ def get_position(symbol):
     if isinstance(positions, list):
         for pos in positions:
             if pos.get('symbol') == symbol:
-                amt = float(pos.get('positionAmt', 0.0))
+                amt = float(pos.get('positionAmt', '0'))
                 side = pos.get('positionSide', 'BOTH')
                 if side == 'LONG' or (side == 'BOTH' and amt > 0):
                     long_qty = amt
@@ -160,21 +165,24 @@ def get_usdt_balance():
 def set_leverage(symbol, lev):
     try:
         client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
-        logger.info(f"Leverage set → {lev}x")
+        logger.info(f"Leverage set to {lev}x")
     except Exception as e:
-        logger.warning(f"leverage set failed (may already be set): {e}")
+        logger.warning(f"Leverage set failed (possibly already set): {e}")
 
 
 def market_order(symbol, side: str, quantity: float, position_side: str = None):
     if abs(quantity) < 0.0005:
         return None
 
-    quantity = round(quantity, 3)
+    qty = round(quantity, QTY_ROUND_DECIMALS)
+    if qty <= 0:
+        return None
+
     params = {
         "symbol": symbol,
         "side": side.upper(),
         "type": "MARKET",
-        "quantity": quantity,
+        "quantity": qty,
         "newOrderRespType": "RESULT"
     }
 
@@ -183,7 +191,7 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
 
     try:
         order = client.rest_api.new_order(**params)
-        msg = f"ORDER FILLED → {side.upper()} {quantity:.3f} {symbol}"
+        msg = f"ORDER FILLED → {side.upper()} {qty:.3f} {symbol}"
         if position_side:
             msg += f" ({position_side})"
         msg += f"  ID: {order.get('orderId')}"
@@ -191,9 +199,41 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         logger.info(msg)
         return order
     except Exception as e:
-        logger.error(f"order failed: {e}")
-        print(f"order failed: {e}")
+        logger.error(f"market order failed: {e}")
+        print(f"ORDER FAILED: {e}")
         return None
+
+
+def place_protective_stop(symbol, side: str, qty: float, entry_price: float):
+    """Places a STOP_MARKET to close the position if hit"""
+    if side.upper() == "LONG":
+        stop_price = entry_price * (1 - STOP_LOSS_PCT)
+        stop_side = "SELL"
+        pos_side = "LONG"
+    else:
+        stop_price = entry_price * (1 + STOP_LOSS_PCT)
+        stop_side = "BUY"
+        pos_side = "SHORT"
+
+    stop_price = round(stop_price, PRICE_ROUND_DECIMALS)
+
+    params = {
+        "symbol": symbol,
+        "side": stop_side,
+        "type": "STOP_MARKET",
+        "quantity": round(qty, QTY_ROUND_DECIMALS),
+        "stopPrice": stop_price,
+        "closePosition": True,  # closes the full position
+    }
+
+    if config.HEDGE_MODE:
+        params["positionSide"] = pos_side
+
+    try:
+        order = client.rest_api.new_order(**params)
+        logger.info(f"STOP LOSS placed @ {stop_price:,.2f} ({side} {qty:.3f}) ID: {order.get('orderId')}")
+    except Exception as e:
+        logger.critical(f"!!! FAILED TO PLACE STOP LOSS !!! DANGER: {e}")
 
 
 def close_side(symbol, side: str, qty: float):
@@ -224,15 +264,21 @@ def should_close_short(price: float, ema: float) -> bool:
 
 
 def calculate_quantity(usdt: float, price: float) -> float:
+    if price <= 0:
+        return 0.0
     risk_usdt = usdt * config.POSITION_PCT
-    qty = (risk_usdt * config.LEVERAGE) / price
-    return round(qty, 3)
+    notional = risk_usdt * config.LEVERAGE
+    if notional < MIN_NOTIONAL_USDT:
+        logger.warning(f"Notional too small: {notional:.2f} < {MIN_NOTIONAL_USDT}")
+        return 0.0
+    qty = notional / price
+    return qty  # rounding done in market_order
 
 
 def run_once():
     df = get_klines(config.SYMBOL, config.INTERVAL, limit=config.EMA_PERIOD * 4)
     if df is None or len(df) < config.EMA_PERIOD + 30:
-        logger.warning("not enough candles")
+        logger.warning("Not enough candles for EMA calculation")
         return
 
     df['ema'] = df['close'].ewm(span=config.EMA_PERIOD, adjust=False).mean()
@@ -242,11 +288,11 @@ def run_once():
     daily_open = get_daily_open(config.SYMBOL)
 
     if daily_open is None:
+        logger.warning("Could not retrieve daily open price")
         return
 
-    print(f"{datetime.utcnow():%Y-%m-%d %H:%M UTC} | "
-          f"price {price:,.2f} | ema{config.EMA_PERIOD} {ema:,.2f} | "
-          f"daily open {daily_open:,.2f}")
+    ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    print(f"{ts} | price {price:,.2f} | EMA{config.EMA_PERIOD} {ema:,.2f} | daily open {daily_open:,.2f}")
     logger.info(f"price {price:,.2f} | ema {ema:,.2f} | open {daily_open:,.2f}")
 
     long_qty, short_qty = get_position(config.SYMBOL)
@@ -260,27 +306,33 @@ def run_once():
             close_side(config.SYMBOL, "SHORT", short_qty)
         return
 
-    # Close
+    # ─── Close logic ────────────────────────────────────────────────────
     if is_long(long_qty) and should_close_long(price, ema):
-        logger.info("closing LONG")
+        logger.info("Closing LONG position")
         close_side(config.SYMBOL, "LONG", long_qty)
 
     if is_short(short_qty) and should_close_short(price, ema):
-        logger.info("closing SHORT")
+        logger.info("Closing SHORT position")
         close_side(config.SYMBOL, "SHORT", short_qty)
 
-    # Open
+    # ─── Open logic ─────────────────────────────────────────────────────
     if not is_long(long_qty) and should_open_long(price, ema, daily_open):
         qty = calculate_quantity(usdt, price)
         if qty >= 0.001:
             logger.info(f"LONG signal → qty ≈ {qty:.3f}")
-            market_order(config.SYMBOL, "BUY", qty, "LONG" if config.HEDGE_MODE else None)
+            order = market_order(config.SYMBOL, "BUY", qty, "LONG" if config.HEDGE_MODE else None)
+            if order and 'avgPrice' in order:
+                entry_price = float(order['avgPrice'])
+                place_protective_stop(config.SYMBOL, "LONG", qty, entry_price)
 
     if not is_short(short_qty) and should_open_short(price, ema, daily_open):
         qty = calculate_quantity(usdt, price)
         if qty >= 0.001:
             logger.info(f"SHORT signal → qty ≈ {qty:.3f}")
-            market_order(config.SYMBOL, "SELL", qty, "SHORT" if config.HEDGE_MODE else None)
+            order = market_order(config.SYMBOL, "SELL", qty, "SHORT" if config.HEDGE_MODE else None)
+            if order and 'avgPrice' in order:
+                entry_price = float(order['avgPrice'])
+                place_protective_stop(config.SYMBOL, "SHORT", qty, entry_price)
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────
@@ -300,6 +352,6 @@ if __name__ == "__main__":
             break
         except Exception as e:
             logger.critical(f"MAIN LOOP ERROR: {e}", exc_info=True)
-            print(f"CRITICAL: {e}")
+            print(f"CRITICAL ERROR: {e}")
 
         time.sleep(config.SLEEP_SECONDS)

@@ -1,182 +1,154 @@
-import requests
 import ccxt
 import pandas as pd
-import config1
-import telegram
-import os
-from datetime import datetime
+import asyncio
+import nest_asyncio
+import requests
+from datetime import datetime, timezone
 
-# Fetch SELECTED_SYMBOLS from Binance Futures
+interval = '5m'  # 5-minute candlesticks
+
+# Initialize binance client (used only for data fetching)
+binance = ccxt.binance({
+    'enableRateLimit': True,
+    # You can leave apiKey/secret empty if you only fetch public data
+    # 'apiKey': config.API_KEY,
+    # 'secret': config.SECRET,
+})
+
+# Dictionary to store the last sent signal type per symbol (to avoid duplicates)
+last_signals = {}
+
+# Fetch USDT perpetual futures symbols dynamically from Binance
 url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 try:
     response = requests.get(url)
     response.raise_for_status()
     data = response.json()
-    SELECTED_SYMBOLS = [s['symbol'] for s in data['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+
+    SELECTED_SYMBOLS = [
+        s['symbol'] for s in data['symbols']
+        if s['quoteAsset'] == 'USDT' 
+        and s['contractType'] == 'PERPETUAL'
+        and s['status'] == 'TRADING'
+    ]
+    print(f"Loaded {len(SELECTED_SYMBOLS)} USDT perpetual symbols")
 except requests.exceptions.RequestException as e:
-    print(f"Error fetching data from Binance Futures: {e}")
+    print(f"Error fetching futures symbols: {e}")
     SELECTED_SYMBOLS = []
 
-# Initialize Binance client
-binance = ccxt.binance({
-    'apiKey': config1.API_KEY,
-    'secret': config1.API_SECRET,
-    'timeout': 30000,
-    'enableRateLimit': True,
-})
-
-# Initialize Telegram bot
-bot = telegram.Bot(token=config1.TELEGRAM_BOT_TOKEN)
-
-# Function to get historical data
-def get_historical_data(symbol, interval, limit):
+# Function to get historical candlestick data
+def get_historical_data(symbol, interval, limit=20):
     ohlcv = binance.fetch_ohlcv(symbol, interval, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
-    df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
     return df
 
-# Function to process symbol and track trades
-def process_symbol(symbol):
+# Function to get current day's open price (from daily candles)
+def get_day_open_price(symbol):
+    day_ohlcv = binance.fetch_ohlcv(symbol, '1d', limit=3)
+    df_day = pd.DataFrame(day_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df_day['timestamp'] = pd.to_datetime(df_day['timestamp'], unit='ms')
+    df_day.set_index('timestamp', inplace=True)
+    # Use close of previous daily candle as "day open" reference
+    day_open_price = df_day['close'].iloc[-2]
+    return day_open_price
+
+# Simple SMA
+def calculate_sma(df, period):
+    return df['close'].rolling(window=period).mean()
+
+# Check if short SMA crossed above/below day-open reference
+def check_sma_crossover_vs_day_open(df, day_open_price, short_period=3):
+    df['sma_short'] = calculate_sma(df, short_period)
+    cross_over  = df['sma_short'].iloc[-2] > day_open_price
+    cross_under = df['sma_short'].iloc[-2] < day_open_price
+    return cross_over, cross_under
+
+# Previous day amplitude ratio (high/low)
+def get_previous_day_amplitude(symbol):
+    daily_ohlcv = binance.fetch_ohlcv(symbol, '1d', limit=5)
+    df_daily = pd.DataFrame(daily_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df_daily['timestamp'] = pd.to_datetime(df_daily['timestamp'], unit='ms')
+    df_daily.set_index('timestamp', inplace=True)
+    
+    prev_day_high = df_daily['high'].iloc[-2]
+    prev_day_low  = df_daily['low'].iloc[-2]
+    amplitude_ratio = prev_day_high / prev_day_low
+    return amplitude_ratio
+
+# Send signal to Binance webhook
+def send_binance_signal(symbol, side, close_price):
+    # Prevent sending the same signal repeatedly
+    key = f"{symbol}_{side}"
+    if last_signals.get(key) == close_price:
+        return  # same signal already sent at this price level
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    payload = {
+        "symbol": symbol,                     # e.g. BTCUSDT
+        "side": side.upper(),                 # BUY or SELL
+        "positionSide": "BOTH",
+        "investmentType": "notional_value",
+        "amount": "10",
+        "price": str(close_price),
+        "reduceOnly": False,
+        "positionMode": "one_way_mode",
+        "signalId": "c8c565bf-ea6b-4a76-93d8-76fd0d6900d0",
+        "uid": "30a07ee161389902638c30aeed695061035924de7c970f76b14ba6088aaaa7b8"
+    }
+
     try:
-        df_weekly = get_historical_data(symbol, '1w', 1)
-        df_5m = get_historical_data(symbol, '5m', 2016)
-        
-        if df_weekly.empty or df_5m.empty or len(df_5m) < 1000:
-            return symbol, None, None, None, None, None
-        
-        week_open = df_weekly['Open'].iloc[-1]
-        current_5m_close = df_5m['Close'].iloc[-1]
-        
-        # Determine final position
-        percent_change = ((current_5m_close - week_open) / week_open) * 100
-        final_position = "Long" if current_5m_close > week_open else "Short"
-        
-        # Backtest simulation: Count actual crosses
-        trades = []
-        max_profit = 0
-        entry_price = None
-        previous_position = None
-        
-        for i in range(len(df_5m)):
-            current_price = df_5m['Close'].iloc[i]
-            current_position = "Long" if current_price > week_open else "Short"
-            
-            # First candle: set initial position
-            if i == 0:
-                previous_position = current_position
-                entry_price = current_price
-                continue
-            
-            # Check for position change (cross)
-            if current_position != previous_position:
-                # Close previous trade
-                if previous_position == "Long":
-                    profit = ((current_price - entry_price) / entry_price) * 100
-                else:  # Short
-                    profit = ((entry_price - current_price) / entry_price) * 100
-                
-                trades.append({
-                    'entry': entry_price,
-                    'exit': current_price,
-                    'profit': profit
-                })
-                
-                # Start new trade
-                entry_price = current_price
-                previous_position = current_position
-            
-            # Track max profit for current trade
-            if entry_price is not None:
-                if current_position == "Long":
-                    current_profit = ((current_price - entry_price) / entry_price) * 100
-                else:  # Short
-                    current_profit = ((entry_price - current_price) / entry_price) * 100
-                max_profit = max(max_profit, current_profit)
-        
-        # Close final trade if open
-        if entry_price is not None and len(df_5m) > 0:
-            last_price = df_5m['Close'].iloc[-1]
-            if previous_position == "Long":
-                profit = ((last_price - entry_price) / entry_price) * 100
-            else:  # Short
-                profit = ((entry_price - last_price) / entry_price) * 100
-            trades.append({
-                'entry': entry_price,
-                'exit': last_price,
-                'profit': profit
-            })
-        
-        total_trades = len(trades)
-        cumulative_profit = sum(trade['profit'] for trade in trades) if trades else 0
-        
-        return symbol, percent_change, final_position, max_profit, total_trades, cumulative_profit
-    
-    except Exception as e:
-        print(f"Error processing {symbol}: {e}")
-        return symbol, None, None, None, None, None
-
-# Function to save and send results
-async def save_and_send_results(long_positions, short_positions, long_cumulative, short_cumulative):
-    long_df = pd.DataFrame(long_positions, columns=['Symbol', 'Change %', 'Max Profit %', 'Trades', 'Cumulative Profit %'])
-    short_df = pd.DataFrame(short_positions, columns=['Symbol', 'Change %', 'Max Profit %', 'Trades', 'Cumulative Profit %'])
-    
-    filename = 'trading_positions.xlsx'
-    with pd.ExcelWriter(filename) as writer:
-        long_df.to_excel(writer, sheet_name='Long Positions', index=False)
-        short_df.to_excel(writer, sheet_name='Short Positions', index=False)
-        summary_df = pd.DataFrame({
-            'Metric': ['Cumulative Long %', 'Cumulative Short %'],
-            'Value': [f"{long_cumulative:.2f}%", f"{short_cumulative:.2f}%"]
-        })
-        summary_df.to_excel(writer, sheet_name='Summary', index=False)
-    
-    with open(filename, 'rb') as file:
-        await bot.send_document(
-            chat_id=config1.TELEGRAM_CHAT_ID,
-            document=file,
-            caption=f"Trading Positions - {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        response = requests.post(
+            "https://cb.binanceapi.com/webhook/tv/handle-signal",
+            json=payload,
+            timeout=10
         )
-    
-    os.remove(filename)
 
-# Main function
+        if response.status_code in (200, 201):
+            print(f"[{timestamp}] SUCCESS → {symbol} {side} @ {close_price}")
+            last_signals[key] = close_price
+        else:
+            print(f"[{timestamp}] FAILED {symbol} {side} → {response.status_code} {response.text[:200]}")
+
+    except requests.RequestException as e:
+        print(f"[{timestamp}] Request error {symbol} {side}: {e}")
+
+# ────────────────────────────────────────────────
 async def main():
-    long_positions = []
-    short_positions = []
-    
-    print("Processing symbols...")
-    for symbol in SELECTED_SYMBOLS:
-        sym, percent, position, max_profit, trades, cum_profit = process_symbol(symbol)
-        if percent is not None:
-            if position == "Long":
-                long_positions.append((sym, percent, max_profit, trades, cum_profit))
-            elif position == "Short":
-                short_positions.append((sym, percent, max_profit, trades, cum_profit))
-    
-    long_cumulative = sum(percent for _, percent, _, _, _ in long_positions)
-    short_cumulative = sum(percent for _, percent, _, _, _ in short_positions)
-    
-    long_positions.sort(key=lambda x: x[1], reverse=True)
-    short_positions.sort(key=lambda x: x[1], reverse=True)
-    
-    print("\nLong Positions:")
-    print("Symbol | Change % | Max Profit % | Trades | Cumulative Profit %")
-    print("-" * 60)
-    for symbol, percent, max_p, trades, cum_p in long_positions:
-        print(f"{symbol:<12} | {percent:>6.2f}% | {max_p:>8.2f}% | {trades:>6} | {cum_p:>8.2f}%")
-    print(f"\nCumulative Long Positions Percentage: {long_cumulative:.2f}%")
-    
-    print("\nShort Positions:")
-    print("Symbol | Change % | Max Profit % | Trades | Cumulative Profit %")
-    print("-" * 60)
-    for symbol, percent, max_p, trades, cum_p in short_positions:
-        print(f"{symbol:<12} | {percent:>6.2f}% | {max_p:>8.2f}% | {trades:>6} | {cum_p:>8.2f}%")
-    print(f"\nCumulative Short Positions Percentage: {short_cumulative:.2f}%")
-    
-    await save_and_send_results(long_positions, short_positions, long_cumulative, short_cumulative)
+    if not SELECTED_SYMBOLS:
+        print("No symbols loaded. Exiting.")
+        return
+
+    while True:
+        for symbol in SELECTED_SYMBOLS:
+            try:
+                df = get_historical_data(symbol, interval, limit=25)
+                if len(df) < 10:
+                    continue
+
+                day_open = get_day_open_price(symbol)
+                cross_over, cross_under = check_sma_crossover_vs_day_open(df, day_open)
+
+                close_price = df['close'].iloc[-1]
+                amplitude_ratio = get_previous_day_amplitude(symbol)
+
+                if amplitude_ratio >= 1.08:
+                    if cross_over:
+                        send_binance_signal(symbol, "buy", close_price)
+                    elif cross_under:
+                        send_binance_signal(symbol, "sell", close_price)
+                # else:
+                #     print(f"{symbol} — prev day range too small ({amplitude_ratio:.4f})")
+
+            except Exception as e:
+                print(f"Error {symbol}: {e}")
+
+        await asyncio.sleep(300)  # ≈ 5 minutes
+
+# Allow nested event loops (useful in Jupyter/colab)
+nest_asyncio.apply()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

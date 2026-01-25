@@ -5,20 +5,19 @@ import nest_asyncio
 import requests
 from datetime import datetime, timezone
 
-interval = '5m'  # 5-minute candlesticks
+interval = '1m'  # ← changed to 1-minute candles
 
-# Initialize binance client (used only for data fetching)
+# Initialize binance client (public data only is enough)
 binance = ccxt.binance({
     'enableRateLimit': True,
-    # You can leave apiKey/secret empty if you only fetch public data
-    # 'apiKey': config.API_KEY,
-    # 'secret': config.SECRET,
+    # 'apiKey': '...',     # not needed for OHLCV
+    # 'secret': '...',
 })
 
-# Dictionary to store the last sent signal type per symbol (to avoid duplicates)
+# Dictionary to prevent sending duplicate signals at same price
 last_signals = {}
 
-# Fetch USDT perpetual futures symbols dynamically from Binance
+# Fetch USDT perpetual futures symbols dynamically
 url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 try:
     response = requests.get(url)
@@ -27,7 +26,7 @@ try:
 
     SELECTED_SYMBOLS = [
         s['symbol'] for s in data['symbols']
-        if s['quoteAsset'] == 'USDT' 
+        if s['quoteAsset'] == 'USDT'
         and s['contractType'] == 'PERPETUAL'
         and s['status'] == 'TRADING'
     ]
@@ -36,59 +35,44 @@ except requests.exceptions.RequestException as e:
     print(f"Error fetching futures symbols: {e}")
     SELECTED_SYMBOLS = []
 
-# Function to get historical candlestick data
-def get_historical_data(symbol, interval, limit=20):
+# Get recent candlestick data
+def get_historical_data(symbol, interval, limit=25):
     ohlcv = binance.fetch_ohlcv(symbol, interval, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     return df
 
-# Function to get current day's open price (from daily candles)
-def get_day_open_price(symbol):
+# Get reference price from previous daily close
+def get_day_reference_price(symbol):
     day_ohlcv = binance.fetch_ohlcv(symbol, '1d', limit=3)
     df_day = pd.DataFrame(day_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_day['timestamp'] = pd.to_datetime(df_day['timestamp'], unit='ms')
     df_day.set_index('timestamp', inplace=True)
-    # Use close of previous daily candle as "day open" reference
-    day_open_price = df_day['close'].iloc[-2]
-    return day_open_price
+    # Using previous daily close as reference level
+    return df_day['close'].iloc[-2]
 
-# Simple SMA
+# SMA calculation
 def calculate_sma(df, period):
     return df['close'].rolling(window=period).mean()
 
-# Check if short SMA crossed above/below day-open reference
-def check_sma_crossover_vs_day_open(df, day_open_price, short_period=3):
+# Check crossover / crossunder vs reference price
+def check_sma_crossover_vs_reference(df, reference_price, short_period=3):
     df['sma_short'] = calculate_sma(df, short_period)
-    cross_over  = df['sma_short'].iloc[-2] > day_open_price
-    cross_under = df['sma_short'].iloc[-2] < day_open_price
+    cross_over  = df['sma_short'].iloc[-2] <= reference_price and df['sma_short'].iloc[-1] > reference_price
+    cross_under = df['sma_short'].iloc[-2] >= reference_price and df['sma_short'].iloc[-1] < reference_price
     return cross_over, cross_under
-
-# Previous day amplitude ratio (high/low)
-def get_previous_day_amplitude(symbol):
-    daily_ohlcv = binance.fetch_ohlcv(symbol, '1d', limit=5)
-    df_daily = pd.DataFrame(daily_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df_daily['timestamp'] = pd.to_datetime(df_daily['timestamp'], unit='ms')
-    df_daily.set_index('timestamp', inplace=True)
-    
-    prev_day_high = df_daily['high'].iloc[-2]
-    prev_day_low  = df_daily['low'].iloc[-2]
-    amplitude_ratio = prev_day_high / prev_day_low
-    return amplitude_ratio
 
 # Send signal to Binance webhook
 def send_binance_signal(symbol, side, close_price):
-    # Prevent sending the same signal repeatedly
     key = f"{symbol}_{side}"
+    # Avoid resending at exactly same price
     if last_signals.get(key) == close_price:
-        return  # same signal already sent at this price level
+        return
 
-    timestamp = datetime.now(timezone.utc).isoformat()
-    
     payload = {
-        "symbol": symbol,                     # e.g. BTCUSDT
-        "side": side.upper(),                 # BUY or SELL
+        "symbol": symbol,
+        "side": side.upper(),               # BUY or SELL
         "positionSide": "BOTH",
         "investmentType": "notional_value",
         "amount": "10",
@@ -106,14 +90,16 @@ def send_binance_signal(symbol, side, close_price):
             timeout=10
         )
 
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         if response.status_code in (200, 201):
-            print(f"[{timestamp}] SUCCESS → {symbol} {side} @ {close_price}")
+            print(f"[{ts}] OK → {symbol} {side} @ {close_price:,.2f}")
             last_signals[key] = close_price
         else:
-            print(f"[{timestamp}] FAILED {symbol} {side} → {response.status_code} {response.text[:200]}")
+            print(f"[{ts}] FAIL {symbol} {side} → {response.status_code} {response.text[:180]}")
 
     except requests.RequestException as e:
-        print(f"[{timestamp}] Request error {symbol} {side}: {e}")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"[{ts}] Request error {symbol} {side}: {e}")
 
 # ────────────────────────────────────────────────
 async def main():
@@ -121,33 +107,31 @@ async def main():
         print("No symbols loaded. Exiting.")
         return
 
+    print("Starting 1m SMA(3) crossover bot — checking every ~60 seconds")
+
     while True:
         for symbol in SELECTED_SYMBOLS:
             try:
-                df = get_historical_data(symbol, interval, limit=25)
+                df = get_historical_data(symbol, interval, limit=40)
                 if len(df) < 10:
                     continue
 
-                day_open = get_day_open_price(symbol)
-                cross_over, cross_under = check_sma_crossover_vs_day_open(df, day_open)
+                ref_price = get_day_reference_price(symbol)
+                cross_over, cross_under = check_sma_crossover_vs_reference(df, ref_price)
 
                 close_price = df['close'].iloc[-1]
-                amplitude_ratio = get_previous_day_amplitude(symbol)
 
-                if amplitude_ratio >= 1.08:
-                    if cross_over:
-                        send_binance_signal(symbol, "buy", close_price)
-                    elif cross_under:
-                        send_binance_signal(symbol, "sell", close_price)
-                # else:
-                #     print(f"{symbol} — prev day range too small ({amplitude_ratio:.4f})")
+                if cross_over:
+                    send_binance_signal(symbol, "buy", close_price)
+                elif cross_under:
+                    send_binance_signal(symbol, "sell", close_price)
 
             except Exception as e:
-                print(f"Error {symbol}: {e}")
+                print(f"Error {symbol}: {type(e).__name__} - {e}")
 
-        await asyncio.sleep(300)  # ≈ 5 minutes
+        await asyncio.sleep(60)  # ← changed to 60 seconds
 
-# Allow nested event loops (useful in Jupyter/colab)
+# Allow nested event loops (Jupyter, IPython, etc.)
 nest_asyncio.apply()
 
 if __name__ == "__main__":

@@ -1,12 +1,11 @@
 # bot.py
 # Binance USDS-M Futures – ORDER PLACEMENT TEST ONLY
 # XRPUSDT – VERY SMALL SIZE – REAL MONEY – EXTREME CAUTION
-# This version IGNORES all trading signals – just tests open/close
-# No MIN_SAFE_BALANCE check anymore
+# No MIN_SAFE_BALANCE check – forced open/close cycle
 
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Official SDK for trading/account
 try:
@@ -17,14 +16,14 @@ except ImportError:
     print("Missing official SDK – pip install binance-sdk-derivatives-trading-usds-futures binance-common")
     exit(1)
 
-import config  # must contain: API_KEY, API_SECRET, HEDGE_MODE (bool)
+import config  # must contain: API_KEY, API_SECRET  (HEDGE_MODE is now optional)
 
 # ─── Config for TEST ────────────────────────────────────────────────────────
-TEST_MODE            = True             # ← set False to disable forced orders
+TEST_MODE            = True
 SYMBOL               = "XRPUSDT"
-TEST_QUANTITY        = 10.0             # very small – adjust if needed (XRPUSDT step usually 1)
+TEST_QUANTITY        = 10.0             # very small – change to 5 or 2 if needed
 LEVERAGE             = 3
-SLEEP_SECONDS        = 10               # fast for testing
+SLEEP_SECONDS        = 10
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -97,7 +96,7 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         print("Quantity too small – skipping")
         return None
 
-    qty = round(quantity, 0)  # XRPUSDT usually integer qty
+    qty = round(quantity, 0)  # XRPUSDT usually integer
     params = {
         "symbol": symbol,
         "side": side.upper(),
@@ -105,7 +104,8 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         "quantity": qty,
         "newOrderRespType": "RESULT"
     }
-    if config.HEDGE_MODE and position_side:
+    # Use getattr to avoid AttributeError if HEDGE_MODE missing in config
+    if getattr(config, 'HEDGE_MODE', True) and position_side:
         params["positionSide"] = position_side.upper()
 
     try:
@@ -130,26 +130,26 @@ def close_side(symbol, side: str, qty: float):
     qty_abs = abs(qty)
     logger.info(f"Closing {side} → {order_side} {qty_abs}")
     print(f"Closing {side} → {order_side} {qty_abs}")
-    return market_order(symbol, order_side, qty_abs, side if config.HEDGE_MODE else None)
+    return market_order(symbol, order_side, qty_abs, side if getattr(config, 'HEDGE_MODE', True) else None)
 
 
-# ─── Test logic (forced open → close cycle) ─────────────────────────────────
+# ─── Test logic ─────────────────────────────────────────────────────────────
 
 def run_test():
     long_qty, short_qty = get_position(SYMBOL)
 
     print(f"LONG: {long_qty:.2f} | SHORT: {short_qty:.2f}")
 
-    # If no position → open LONG
+    # No position → force open LONG
     if not is_long(long_qty) and not is_short(short_qty):
         print("No position → forcing OPEN LONG")
         logger.info("Forcing OPEN LONG for test")
-        order = market_order(SYMBOL, "BUY", TEST_QUANTITY, "LONG" if config.HEDGE_MODE else None)
+        order = market_order(SYMBOL, "BUY", TEST_QUANTITY, "LONG" if getattr(config, 'HEDGE_MODE', True) else None)
         if order:
             print("Open successful → waiting next cycle to close")
         return
 
-    # If has LONG → close it
+    # Has LONG → force close
     if is_long(long_qty):
         print("Has LONG position → forcing CLOSE")
         logger.info("Forcing CLOSE LONG for test")
@@ -172,7 +172,8 @@ if __name__ == "__main__":
 
     while TEST_MODE:
         cycle += 1
-        print(f"\n--- Test cycle {cycle} at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
+        now_utc = datetime.now(timezone.UTC)
+        print(f"\n--- Test cycle {cycle} at {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
         try:
             run_test()
         except KeyboardInterrupt:

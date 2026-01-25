@@ -1,7 +1,6 @@
 # bot.py
-# Binance USDS-M Futures – ORDER PLACEMENT TEST ONLY
+# Binance USDS-M Futures – ORDER PLACEMENT TEST ONLY (adapted to SDK style)
 # XRPUSDT – VERY SMALL SIZE – REAL MONEY – EXTREME CAUTION
-# Removed newOrderRespType (not supported by this SDK)
 
 import time
 import logging
@@ -9,6 +8,7 @@ from datetime import datetime, timezone
 
 try:
     from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
+    from binance_sdk_derivatives_trading_usds_futures.rest_api.models import NewOrderSideEnum
     from binance_common.configuration import ConfigurationRestAPI
     from binance_common.constants import DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
 except ImportError:
@@ -20,7 +20,7 @@ import config  # needs API_KEY, API_SECRET (HEDGE_MODE optional)
 # ─── Config ─────────────────────────────────────────────────────────────────
 TEST_MODE     = True
 SYMBOL        = "XRPUSDT"
-TEST_QUANTITY = 10.0          # very small
+TEST_QUANTITY = 10.0          # very small – try 5 or 2 if rejected
 LEVERAGE      = 3
 SLEEP_SECONDS = 10
 
@@ -89,49 +89,57 @@ def set_leverage(symbol, lev):
         logger.warning(f"Leverage set failed (may already be set): {e}")
 
 
-def market_order(symbol, side: str, quantity: float, position_side: str = None):
+def market_order(symbol, side_enum, quantity: float, position_side: str = None):
     if quantity < 0.1:
         print("Quantity too small – skipping")
         return None
 
-    qty = round(quantity, 0)  # XRPUSDT usually uses integer steps
+    qty = round(quantity, 0)  # XRPUSDT usually integer
 
     params = {
         "symbol": symbol,
-        "side": side.upper(),
+        "side": side_enum.value,           # Use Enum .value as in reference
         "type": "MARKET",
         "quantity": qty,
     }
+
     if getattr(config, 'HEDGE_MODE', True) and position_side:
         params["positionSide"] = position_side.upper()
 
     try:
-        order = client.rest_api.new_order(**params)
-        msg = f"ORDER FILLED → {side.upper()} {qty} {symbol}"
+        response = client.rest_api.new_order(**params)
+
+        # Handle response (like in reference code)
+        rate_limits = getattr(response, 'rate_limits', None)
+        if rate_limits:
+            logger.info(f"new_order rate limits: {rate_limits}")
+
+        # Try to get data
+        data = getattr(response, 'data', None) or response
+        logger.info(f"new_order response: {data}")
+
+        msg = f"ORDER SUCCESS → {side_enum.name} {qty} {symbol}"
         if position_side:
             msg += f" ({position_side})"
-        # Many SDKs return orderId even without newOrderRespType
-        if hasattr(order, 'orderId'):
-            msg += f"  ID: {order.orderId}"
-        elif isinstance(order, dict) and 'orderId' in order:
-            msg += f"  ID: {order['orderId']}"
+        if hasattr(data, 'orderId') or (isinstance(data, dict) and 'orderId' in data):
+            order_id = data.orderId if hasattr(data, 'orderId') else data['orderId']
+            msg += f"  ID: {order_id}"
         print(msg)
-        logger.info(msg)
-        return order
+        return response
     except Exception as e:
         logger.error(f"order failed: {e}")
         print(f"ORDER FAILED: {e}")
         return None
 
 
-def close_side(symbol, side: str, qty: float):
+def close_side(symbol, side_enum, qty: float):
     if abs(qty) < 0.1:
         return None
-    order_side = "SELL" if side == "LONG" else "BUY"
+    order_side_enum = NewOrderSideEnum["SELL"] if side_enum == NewOrderSideEnum["BUY"] else NewOrderSideEnum["BUY"]
     qty_abs = abs(qty)
-    logger.info(f"Closing {side} → {order_side} {qty_abs}")
-    print(f"Closing {side} → {order_side} {qty_abs}")
-    return market_order(symbol, order_side, qty_abs, side if getattr(config, 'HEDGE_MODE', True) else None)
+    logger.info(f"Closing {side_enum.name} → {order_side_enum.name} {qty_abs}")
+    print(f"Closing {side_enum.name} → {order_side_enum.name} {qty_abs}")
+    return market_order(symbol, order_side_enum, qty_abs, side_enum.name if getattr(config, 'HEDGE_MODE', True) else None)
 
 
 # ─── Test logic ─────────────────────────────────────────────────────────────
@@ -144,15 +152,15 @@ def run_test():
     if not is_long(long_qty) and not is_short(short_qty):
         print("No position → forcing OPEN LONG")
         logger.info("Forcing OPEN LONG for test")
-        order = market_order(SYMBOL, "BUY", TEST_QUANTITY, "LONG" if getattr(config, 'HEDGE_MODE', True) else None)
+        order = market_order(SYMBOL, NewOrderSideEnum["BUY"], TEST_QUANTITY, "LONG" if getattr(config, 'HEDGE_MODE', True) else None)
         if order:
-            print("Open appears successful → check next cycle")
+            print("Open appears successful → check next cycle / Binance UI")
         return
 
     if is_long(long_qty):
         print("Has LONG position → forcing CLOSE")
         logger.info("Forcing CLOSE LONG for test")
-        close_side(SYMBOL, "LONG", long_qty)
+        close_side(SYMBOL, NewOrderSideEnum["BUY"], long_qty)  # BUY was open side → SELL to close
         return
 
     print("Unexpected state – skipping")

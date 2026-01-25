@@ -85,7 +85,7 @@ def send_binance_signal(symbol, side, close_price):
 
     try:
         response = requests.post(
-            "https://cb.binanceapi.com/webhook/tv/handle-signal",
+            "https://cb.binanceapi.com/webhook/handle-signal",
             json=payload,
             timeout=10
         )

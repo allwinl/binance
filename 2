@@ -1,4 +1,6 @@
-# bot.py – FIXED position parsing (call .data() correctly)
+# bot.py
+# Binance USDS-M Futures – LONG/SHORT test + BALANCE + MARGIN DIAGNOSTICS
+# XRPUSDT – VERY SMALL SIZE – REAL MONEY – EXTREME CAUTION
 
 import time
 import logging
@@ -13,7 +15,7 @@ except ImportError:
     print("Missing SDK – pip install binance-sdk-derivatives-trading-usds-futures binance-common")
     exit(1)
 
-import config
+import config  # needs API_KEY, API_SECRET
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 TEST_MODE           = True
@@ -24,7 +26,7 @@ SLEEP_SECONDS       = 20
 ORDER_CONFIRM_DELAY = 6.0
 
 logging.basicConfig(
-    filename='position_debug.log',
+    filename='balance_margin_debug.log',
     level=logging.DEBUG,
     format='%(asctime)s | %(levelname)-5s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S UTC'
@@ -32,8 +34,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 print(">>> LIVE MODE – REAL MONEY – EXTREME CAUTION <<<")
-print(">>> LONG → close → SHORT → close TEST + FIXED POSITION DEBUG <<<")
-logger.critical("BOT STARTED – FIXED POSITION DEBUG – REAL MONEY")
+print(">>> LONG → close → SHORT → close + BALANCE/MARGIN DEBUG <<<")
+logger.critical("BOT STARTED – BALANCE & MARGIN DEBUG – REAL MONEY")
 
 configuration = ConfigurationRestAPI(
     api_key=config.API_KEY,
@@ -42,7 +44,37 @@ configuration = ConfigurationRestAPI(
 )
 client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
-# ─── Fixed position query ───────────────────────────────────────────────────
+# ─── New: Get futures account balance & margin info ─────────────────────────
+
+def print_account_status():
+    try:
+        account = client.rest_api.account_information_v3()
+        usdt_info = None
+        for asset in account.get('assets', []):
+            if asset.get('asset') == 'USDT':
+                usdt_info = asset
+                break
+
+        if usdt_info:
+            print("\nFutures USDT Status:")
+            print(f"  Wallet Balance:     {usdt_info.get('walletBalance', 'N/A')}")
+            print(f"  Available Balance:  {usdt_info.get('availableBalance', 'N/A')}")
+            print(f"  Unrealized PnL:     {usdt_info.get('unrealizedProfit', 'N/A')}")
+            print(f"  Margin Balance:     {usdt_info.get('marginBalance', 'N/A')}")
+        else:
+            print("No USDT asset found in account response")
+
+        # Margin ratio / risk
+        print(f"Margin Ratio (approx): {account.get('marginRatio', 'N/A')}")
+        print(f"Total Maint. Margin:   {account.get('totalMaintMargin', 'N/A')}")
+        print(f"Total Wallet Balance: {account.get('totalWalletBalance', 'N/A')}")
+
+    except Exception as e:
+        print(f"Account info failed: {e}")
+        logger.error(f"Account info failed: {e}")
+
+
+# ─── Position query (fixed .data() call) ────────────────────────────────────
 
 def get_position(symbol):
     qty = 0.0
@@ -52,13 +84,10 @@ def get_position(symbol):
     for endpoint_name in ['position_information_v3', 'position_information_v2']:
         try:
             method = getattr(client.rest_api, endpoint_name)
-            if endpoint_name == 'position_information_v3':
-                resp = method(symbol=symbol)
-            else:
-                resp = method(symbol=symbol)
+            resp = method(symbol=symbol)
 
-            # IMPORTANT: call .data() to get the actual content
-            data = resp.data() if hasattr(resp, 'data') and callable(resp.data) else resp
+            # Call .data() to get real content
+            data = resp.data() if hasattr(resp, 'data') and callable(getattr(resp, 'data')) else resp
 
             raw_data = data
             used_endpoint = endpoint_name
@@ -73,7 +102,7 @@ def get_position(symbol):
                         break
 
             if qty != 0.0:
-                break  # found something non-zero
+                break
 
         except Exception as e:
             logger.error(f"{endpoint_name} failed: {e}")
@@ -101,6 +130,9 @@ def market_order(symbol, side_enum, quantity: float):
 
     qty = round(abs(quantity), 0)
 
+    # Safety check before order
+    print_account_status()
+
     params = {
         "symbol": symbol,
         "side": side_enum.value,
@@ -111,8 +143,7 @@ def market_order(symbol, side_enum, quantity: float):
     try:
         response = client.rest_api.new_order(**params)
 
-        # Call .data() properly
-        data = response.data() if hasattr(response, 'data') and callable(response.data) else response
+        data = response.data() if hasattr(response, 'data') and callable(getattr(response, 'data')) else response
         logger.info(f"new_order response data: {data}")
 
         msg = f"ORDER SUCCESS → {side_enum.name} {qty} {symbol}"
@@ -127,6 +158,11 @@ def market_order(symbol, side_enum, quantity: float):
 
         print(f"Order sent → waiting {ORDER_CONFIRM_DELAY}s for position update...")
         time.sleep(ORDER_CONFIRM_DELAY)
+
+        # Print account again after order
+        print("\nAfter order:")
+        print_account_status()
+
         return response
 
     except Exception as e:
@@ -213,9 +249,12 @@ def run_test_cycle():
 
 if __name__ == "__main__":
     print(f"Starting LONG → close → SHORT → close TEST → {SYMBOL} LEVERAGE {LEVERAGE}")
-    logger.critical(f"TEST STARTED – {SYMBOL} – REAL MONEY – FIXED .data()")
+    logger.critical(f"TEST STARTED – {SYMBOL} – REAL MONEY – BALANCE/MARGIN DEBUG")
 
     set_leverage(SYMBOL, LEVERAGE)
+
+    print("\nInitial account status:")
+    print_account_status()
 
     cycle = 0
 

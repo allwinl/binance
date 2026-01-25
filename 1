@@ -2,6 +2,7 @@
 # Binance USDS-M Futures – ORDER PLACEMENT TEST ONLY
 # XRPUSDT – VERY SMALL SIZE – REAL MONEY – EXTREME CAUTION
 # This version IGNORES all trading signals – just tests open/close
+# No MIN_SAFE_BALANCE check anymore
 
 import time
 import logging
@@ -23,7 +24,6 @@ TEST_MODE            = True             # ← set False to disable forced orders
 SYMBOL               = "XRPUSDT"
 TEST_QUANTITY        = 10.0             # very small – adjust if needed (XRPUSDT step usually 1)
 LEVERAGE             = 3
-MIN_SAFE_BALANCE     = 30.0
 SLEEP_SECONDS        = 10               # fast for testing
 
 # ─── Logging ────────────────────────────────────────────────────────────────
@@ -83,18 +83,6 @@ def is_short(qty: float) -> bool:
     return qty < -0.1
 
 
-def get_usdt_balance():
-    try:
-        account = client.rest_api.account_information_v3()
-        for asset in account.get('assets', []):
-            if asset.get('asset') == 'USDT':
-                return float(asset.get('availableBalance', 0.0))
-        return 0.0
-    except Exception as e:
-        logger.error(f"balance query failed: {e}")
-        return 0.0
-
-
 def set_leverage(symbol, lev):
     try:
         client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
@@ -149,14 +137,8 @@ def close_side(symbol, side: str, qty: float):
 
 def run_test():
     long_qty, short_qty = get_position(SYMBOL)
-    usdt = get_usdt_balance()
 
-    print(f"Balance: {usdt:.2f} USDT | LONG: {long_qty} | SHORT: {short_qty}")
-
-    if usdt < MIN_SAFE_BALANCE:
-        print("Balance too low – skipping cycle")
-        logger.warning("Balance too low – skipping")
-        return
+    print(f"LONG: {long_qty:.2f} | SHORT: {short_qty:.2f}")
 
     # If no position → open LONG
     if not is_long(long_qty) and not is_short(short_qty):
@@ -174,7 +156,8 @@ def run_test():
         close_side(SYMBOL, "LONG", long_qty)
         return
 
-    # Optional: could add SHORT test here if wanted
+    print("Unexpected position state – skipping")
+    logger.warning("Unexpected position state")
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────

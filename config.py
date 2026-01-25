@@ -4,7 +4,7 @@ API_KEY = 'swNCkZLoqzFnYPreUDrFAAnoAxsx16PcJSDlU3AEpep7MwaOCVXzq3YHUDJkZvu8'
 API_SECRET = 'f7774SEvatAbZJHNP6NYZu6dtAb6zxYUBmxQp6c8d90PbNvlvKLYl1ofF7A1J4qn'
 
 
-SYMBOL               = "BTCUSDT"
+SYMBOL               = "XRPUSDT"
 INTERVAL             = "15m"
 EMA_PERIOD           = 21
 LEVERAGE             = 3               # keep low

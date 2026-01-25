@@ -5,7 +5,7 @@ API_SECRET = 'f7774SEvatAbZJHNP6NYZu6dtAb6zxYUBmxQp6c8d90PbNvlvKLYl1ofF7A1J4qn'
 
 
 SYMBOL               = "BTCUSDT"
-INTERVAL             = "1h"
+INTERVAL             = "15m"
 EMA_PERIOD           = 21
 LEVERAGE             = 3               # keep low
 POSITION_PCT         = 0.01            # 1% of available USDT per trade – very conservative

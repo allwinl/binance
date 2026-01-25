@@ -1,7 +1,7 @@
 # bot.py
 # Binance USDS-M Futures – ORDER PLACEMENT TEST ONLY
 # XRPUSDT – VERY SMALL SIZE – REAL MONEY – EXTREME CAUTION
-# No MIN_SAFE_BALANCE check – forced open/close cycle
+# Forced open/close cycle – no trading signals
 
 import time
 import logging
@@ -16,7 +16,7 @@ except ImportError:
     print("Missing official SDK – pip install binance-sdk-derivatives-trading-usds-futures binance-common")
     exit(1)
 
-import config  # must contain: API_KEY, API_SECRET  (HEDGE_MODE is now optional)
+import config  # must contain: API_KEY, API_SECRET  (HEDGE_MODE is optional)
 
 # ─── Config for TEST ────────────────────────────────────────────────────────
 TEST_MODE            = True
@@ -96,7 +96,7 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         print("Quantity too small – skipping")
         return None
 
-    qty = round(quantity, 0)  # XRPUSDT usually integer
+    qty = round(quantity, 0)  # XRPUSDT usually integer steps
     params = {
         "symbol": symbol,
         "side": side.upper(),
@@ -104,7 +104,7 @@ def market_order(symbol, side: str, quantity: float, position_side: str = None):
         "quantity": qty,
         "newOrderRespType": "RESULT"
     }
-    # Use getattr to avoid AttributeError if HEDGE_MODE missing in config
+    # Safe access to HEDGE_MODE (defaults to True if missing in config)
     if getattr(config, 'HEDGE_MODE', True) and position_side:
         params["positionSide"] = position_side.upper()
 
@@ -130,6 +130,7 @@ def close_side(symbol, side: str, qty: float):
     qty_abs = abs(qty)
     logger.info(f"Closing {side} → {order_side} {qty_abs}")
     print(f"Closing {side} → {order_side} {qty_abs}")
+    # Use same safe HEDGE_MODE access
     return market_order(symbol, order_side, qty_abs, side if getattr(config, 'HEDGE_MODE', True) else None)
 
 
@@ -172,7 +173,7 @@ if __name__ == "__main__":
 
     while TEST_MODE:
         cycle += 1
-        now_utc = datetime.now(timezone.UTC)
+        now_utc = datetime.now(timezone.utc)  # ← fixed here (lowercase 'utc')
         print(f"\n--- Test cycle {cycle} at {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
         try:
             run_test()

@@ -1,7 +1,5 @@
 # bot.py
 # Binance USDS-M Futures Telegram bot – auto check every 30 seconds
-# /rem SYMBOL now closes position + removes from monitoring
-# Auto sets Isolated margin + 5x leverage on /add
 
 import asyncio
 import logging
@@ -71,7 +69,7 @@ monitored_symbols: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}  # "LONG", "SHORT" or None
 
 # ────────────────────────────────────────────────
-# Binance helpers
+# Binance helpers (all defined before use)
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> Dict:
@@ -114,26 +112,23 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         return []
 
 def set_leverage_and_margin(symbol: str) -> bool:
-    """Force leverage 5x + Isolated margin for the symbol"""
     lev_resp = signed_request("POST", "/fapi/v1/leverage", {
         "symbol": symbol,
         "leverage": FIXED_LEVERAGE
     })
-
     if "code" in lev_resp and lev_resp["code"] < 0:
-        logger.error(f"Failed to set leverage on {symbol}: {lev_resp}")
+        logger.error(f"Failed leverage on {symbol}: {lev_resp}")
         return False
 
     margin_resp = signed_request("POST", "/fapi/v1/marginType", {
         "symbol": symbol,
         "marginType": FIXED_MARGIN_TYPE
     })
-
     if "code" in margin_resp and margin_resp["code"] < 0:
-        logger.error(f"Failed to set margin type on {symbol}: {margin_resp}")
+        logger.error(f"Failed margin type on {symbol}: {margin_resp}")
         return False
 
-    logger.info(f"Set {symbol}: leverage {FIXED_LEVERAGE}x + {FIXED_MARGIN_TYPE}")
+    logger.info(f"Set {symbol}: {FIXED_LEVERAGE}x + {FIXED_MARGIN_TYPE}")
     return True
 
 def get_current_position_data(symbol: str) -> dict:
@@ -168,45 +163,43 @@ def symbol_is_valid_perp(symbol: str) -> bool:
                 return True
     return False
 
-def get_klines(symbol: str, interval: str, limit: int = 100) -> list:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    try:
-        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params=params, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"Klines failed for {symbol} {interval}: {e}")
-        return []
+def get_current_price(symbol: str) -> float:
+    data = public_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    if isinstance(data, dict) and "markPrice" in data:
+        return float(data["markPrice"])
+    logger.warning(f"No markPrice for {symbol}")
+    return 0.0
 
 def calculate_safe_quantity(symbol: str) -> float:
     filters = public_get("/fapi/v1/exchangeInfo")
     if not isinstance(filters, dict):
+        logger.warning(f"No exchangeInfo for {symbol}")
         return 0.001
 
+    min_notional = 5.0
+    step_size = 0.1
+    min_qty = 0.1
     for s in filters.get("symbols", []):
         if s["symbol"] == symbol:
-            min_notional = 5.0
-            step_size = 0.1
-            min_qty = 0.1
             for f in s.get("filters", []):
                 if f["filterType"] == "LOT_SIZE":
                     min_qty = float(f["minQty"])
                     step_size = float(f["stepSize"])
                 if f["filterType"] == "MIN_NOTIONAL":
                     min_notional = float(f.get("notional", 5.0))
+            break
 
-            price = get_current_price(symbol)
-            if price <= 0:
-                return 0.001
+    price = get_current_price(symbol)
+    if price <= 0:
+        logger.warning(f"No price for {symbol}")
+        return 0.001
 
-            target = min_notional * 1.05
-            raw = target / price
-            steps = math.ceil(raw / step_size)
-            qty = max(steps * step_size, min_qty)
-            logger.info(f"[{symbol}] qty = {qty:.6f}")
-            return round(qty, 6)
-
-    return 0.001
+    target = min_notional * 1.05
+    raw_qty = target / price
+    steps = math.ceil(raw_qty / step_size)
+    qty = max(steps * step_size, min_qty)
+    logger.info(f"[{symbol}] qty = {qty:.6f} (~{target:.2f} USDT)")
+    return round(qty, 6)
 
 def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False) -> Dict:
     if qty <= 0:
@@ -229,7 +222,8 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
 def close_position(symbol: str) -> bool:
     pos = get_current_position_data(symbol)
     if not pos:
-        return True  # no position to close
+        logger.info(f"No position to close on {symbol}")
+        return True
 
     amt = float(pos.get("positionAmt", "0"))
     side = "SELL" if amt > 0 else "BUY"
@@ -241,7 +235,7 @@ def close_position(symbol: str) -> bool:
         logger.info(f"Closed position on {symbol}")
         return True
     else:
-        logger.error(f"Failed to close {symbol}: {resp}")
+        logger.error(f"Close failed on {symbol}: {resp}")
         return False
 
 def close_all_positions():
@@ -267,17 +261,17 @@ def close_all_positions():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Futures EMA-3 bot – auto-reverse + loss-cut + dynamic qty\n\n"
-        "• Every 30s check\n"
-        "• Closes if PnL < threshold\n"
-        "• Quantity ≈ 5% above min notional\n"
-        "• /rem SYMBOL now also closes position\n"
-        "• Auto sets Isolated + 5x on /add\n\n"
+        "Futures EMA-3 bot\n\n"
+        "• Auto-check every 30s\n"
+        "• Auto-reverse on opposite signal\n"
+        "• Loss-cut if PnL < threshold\n"
+        "• /rem SYMBOL closes position + removes\n"
+        "• Auto Isolated + 5x on /add\n\n"
         "Commands:\n"
         "/add SYMBOL\n"
-        "/rem SYMBOL     (close + remove)\n"
-        "/rem or /reset  (close all + clear)\n"
-        "/test SYMBOL    (manual cycle)\n"
+        "/rem SYMBOL\n"
+        "/rem or /reset\n"
+        "/test SYMBOL\n"
     )
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -294,7 +288,6 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if sym in monitored_symbols:
             await update.message.reply_text(f"{sym} already monitored")
         else:
-            # Set leverage + margin type
             if set_leverage_and_margin(sym):
                 monitored_symbols.add(sym)
                 symbol_position_state.setdefault(sym, None)
@@ -303,7 +296,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"Current list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
                 )
             else:
-                await update.message.reply_text(f"Failed to set leverage/margin for {sym}")
+                await update.message.reply_text(f"Failed to set Isolated/5x for {sym}")
     else:
         await update.message.reply_text(f"{sym} not valid or not trading")
 
@@ -328,17 +321,15 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     sym = context.args[0].strip().upper()
     if sym in monitored_symbols:
-        # Close position first if exists
         closed = close_position(sym)
-
         monitored_symbols.remove(sym)
         symbol_position_state.pop(sym, None)
 
         msg = f"Removed {sym} from monitoring"
         if closed:
-            msg += " and closed open position"
+            msg += " and closed any open position"
         else:
-            msg += " (no open position was found)"
+            msg += " (no open position found)"
 
         msg += f"\nCurrent list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
         await update.message.reply_text(msg)
@@ -365,9 +356,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        f"Test cycle on {sym}\n"
-        f"Quantity: {qty:.6f}\n"
-        "Starting LONG → close → SHORT → close ...\n"
+        f"Test cycle {sym} | qty: {qty:.6f}\n"
+        "LONG → close → SHORT → close ...\n"
     )
 
     await update.message.reply_text("1/4 Opening LONG...")
@@ -417,12 +407,12 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Not enough 1m data")
         return
 
-    klines_5m = get_klines(symbol, "5m", 2)
-    if not klines_5m:
-        await update.message.reply_text("Failed to get 5m data")
+    klines_1d = get_klines(symbol, "1d", 2)
+    if not klines_1d:
+        await update.message.reply_text("Failed to get 1d data")
         return
 
-    today_open = float(klines_5m[-1][1])
+    today_open = float(klines_1d[-1][1])
     closes = [float(k[4]) for k in klines_1m]
 
     df = pd.DataFrame({"close": closes})
@@ -433,7 +423,7 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     msg = (
         f"**Manual check {symbol}**\n"
-        f"5m open: {today_open:.4f}\n"
+        f"1d open: {today_open:.4f}\n"
         f"EMA-3: {ema_value:.4f}\n"
         f"Quantity: {qty:.6f}\n"
     )
@@ -485,11 +475,11 @@ async def auto_check_symbols(app: Application) -> None:
                     if not klines_1m or len(klines_1m) < 3:
                         continue
 
-                    klines_5m = get_klines(symbol, "5m", 2)
-                    if not klines_5m:
+                    klines_1d = get_klines(symbol, "1d", 2)
+                    if not klines_1d:
                         continue
 
-                    today_open = float(klines_5m[-1][1])
+                    today_open = float(klines_1d[-1][1])
                     closes = [float(k[4]) for k in klines_1m]
 
                     df = pd.DataFrame({"close": closes})
@@ -497,7 +487,7 @@ async def auto_check_symbols(app: Application) -> None:
                     ema_value = ema_indicator.ema_indicator().iloc[-1]
 
                     logger.info(
-                        f"[{symbol}] 5m open: {today_open:.4f} | EMA-3: {ema_value:.4f} | pos: {current_side or 'None'}"
+                        f"[{symbol}] 1d open: {today_open:.4f} | EMA-3: {ema_value:.4f} | pos: {current_side or 'None'}"
                     )
 
                     should_long  = ema_value > today_open

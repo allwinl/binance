@@ -106,6 +106,16 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         logger.error(f"Public GET failed: {e}")
         return []
 
+def symbol_is_valid_perp(symbol: str) -> bool:
+    data = public_get("/fapi/v1/exchangeInfo")
+    if not isinstance(data, dict):
+        return False
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING":
+                return True
+    return False
+
 def get_symbol_filters(symbol: str) -> dict:
     data = public_get("/fapi/v1/exchangeInfo")
     if not isinstance(data, dict):
@@ -331,7 +341,7 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    # ───── normal EMA logic ─────
+    # normal EMA logic
     await update.message.reply_text(f"Checking {symbol}...")
 
     klines_1m = get_klines(symbol, "1m", 50)

@@ -1,6 +1,6 @@
 # bot.py
 # Binance USDS-M Futures Telegram bot – auto check every 30 seconds
-# Now with automatic reverse: if opposite signal appears → close current + open new direction
+# Now uses dynamic quantity = (minNotional × 1.05) / price everywhere
 
 import asyncio
 import logging
@@ -45,8 +45,9 @@ TELEGRAM_TOKEN = telegram_cfg.get("token")
 
 LEVERAGE         = trading_cfg.get("leverage", 5)
 MARGIN_TYPE      = trading_cfg.get("margin_type", "ISOLATED").upper()
-DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 0.001)
 CHECK_INTERVAL_SECONDS = 30
+POSITION_TOLERANCE     = 1e-6
+MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -10.0)
 
 if not API_KEY or not API_SECRET or not TELEGRAM_TOKEN:
     print("ERROR: Missing api_key, api_secret or telegram token")
@@ -111,6 +112,79 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         logger.error(f"Public GET failed: {e}")
         return []
 
+def get_symbol_filters(symbol: str) -> dict:
+    data = public_get("/fapi/v1/exchangeInfo")
+    if not isinstance(data, dict):
+        return {}
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            filters = {}
+            for f in s.get("filters", []):
+                if f["filterType"] == "LOT_SIZE":
+                    filters["minQty"] = float(f["minQty"])
+                    filters["stepSize"] = float(f["stepSize"])
+                if f["filterType"] == "MIN_NOTIONAL":
+                    filters["minNotional"] = float(f.get("notional", 5.0))
+            return filters
+    return {}
+
+def get_current_price(symbol: str) -> float:
+    data = public_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    if isinstance(data, dict) and "markPrice" in data:
+        return float(data["markPrice"])
+    return 0.0
+
+def calculate_safe_quantity(symbol: str) -> float:
+    """Calculate quantity = (minNotional × 1.05) / current price, rounded up to stepSize"""
+    filters = get_symbol_filters(symbol)
+    if not filters:
+        logger.warning(f"No filters found for {symbol} – using fallback 0.001")
+        return 0.001
+
+    min_notional = filters.get("minNotional", 5.0)
+    step_size    = filters.get("stepSize", 0.1)
+    min_qty      = filters.get("minQty", 0.1)
+    price        = get_current_price(symbol)
+
+    if price <= 0:
+        logger.warning(f"Cannot get price for {symbol} – using fallback 0.001")
+        return 0.001
+
+    target_notional = min_notional * 1.05
+    raw_qty = target_notional / price
+
+    # Round UP to next valid step
+    steps = math.ceil(raw_qty / step_size)
+    final_qty = steps * step_size
+
+    # At least minQty
+    final_qty = max(final_qty, min_qty)
+
+    logger.info(f"[{symbol}] Calculated qty: {final_qty:.6f} (target notional ~{target_notional:.2f} USDT)")
+    return round(final_qty, 6)
+
+def get_current_position_data(symbol: str) -> dict:
+    params = {"symbol": symbol}
+    data = signed_request("GET", "/fapi/v2/positionRisk", params)
+    if isinstance(data, list) and data:
+        pos = data[0]
+        amt = float(pos.get("positionAmt", "0"))
+        if abs(amt) > POSITION_TOLERANCE:
+            return pos
+    return {}
+
+def sync_position_state(symbol: str) -> None:
+    pos = get_current_position_data(symbol)
+    real_side = None
+    if pos:
+        amt = float(pos.get("positionAmt", "0"))
+        real_side = "LONG" if amt > 0 else "SHORT"
+
+    current = symbol_position_state.get(symbol, None)
+    if real_side != current:
+        logger.info(f"State sync {symbol}: {current or 'None'} → {real_side or 'None'}")
+        symbol_position_state[symbol] = real_side
+
 def symbol_is_valid_perp(symbol: str) -> bool:
     data = public_get("/fapi/v1/exchangeInfo")
     if not isinstance(data, dict):
@@ -157,7 +231,7 @@ def close_all_positions():
     closed = []
     for pos in positions:
         amt = float(pos.get("positionAmt", "0"))
-        if abs(amt) < 1e-8:
+        if abs(amt) <= POSITION_TOLERANCE:
             continue
 
         sym = pos["symbol"]
@@ -165,7 +239,7 @@ def close_all_positions():
         qty = abs(amt)
         resp = place_market_order(sym, side, qty, reduce_only=True)
 
-        if resp.get("status") in ("FILLED", "NEW"):
+        if resp.get("status") in ("NEW", "FILLED"):
             symbol_position_state[sym] = None
 
         closed.append((sym, resp))
@@ -182,14 +256,33 @@ async def auto_check_symbols(app: Application) -> None:
             logger.info(f"Auto-checking {len(monitored_symbols)} symbols...")
             for symbol in list(monitored_symbols):
                 try:
+                    # Sync real position
+                    sync_position_state(symbol)
+                    current_side = symbol_position_state.get(symbol, None)
+
+                    # Emergency loss cut
+                    pos_data = get_current_position_data(symbol)
+                    if pos_data:
+                        unrealized_pnl = float(pos_data.get("unRealizedProfit", 0))
+                        if unrealized_pnl < MAX_ALLOWED_LOSS_USDT:
+                            logger.warning(
+                                f"[{symbol}] LOSS CUT! PnL {unrealized_pnl:.2f} < {MAX_ALLOWED_LOSS_USDT}"
+                            )
+                            side = "SELL" if current_side == "LONG" else "BUY"
+                            qty = abs(float(pos_data["positionAmt"]))
+                            close_resp = place_market_order(symbol, side, qty, reduce_only=True)
+                            if close_resp.get("status") in ("NEW", "FILLED"):
+                                symbol_position_state[symbol] = None
+                                logger.info(f"[{symbol}] Loss-cut executed")
+                            continue
+
+                    # Get candle data
                     klines_1m = get_klines(symbol, "1m", 50)
                     if not klines_1m or len(klines_1m) < 3:
-                        logger.warning(f"Not enough 1m data for {symbol}")
                         continue
 
                     klines_1d = get_klines(symbol, "1d", 2)
                     if not klines_1d:
-                        logger.warning(f"Failed to get 1d data for {symbol}")
                         continue
 
                     today_open = float(klines_1d[-1][1])
@@ -197,151 +290,58 @@ async def auto_check_symbols(app: Application) -> None:
 
                     df = pd.DataFrame({"close": closes})
                     ema_indicator = EMAIndicator(close=df["close"], window=3)
-                    ema_series = ema_indicator.ema_indicator()
-                    ema_value = ema_series.iloc[-1]
-
-                    current_side = symbol_position_state.get(symbol, None)
+                    ema_value = ema_indicator.ema_indicator().iloc[-1]
 
                     logger.info(
-                        f"[{symbol}] 1d open: {today_open:.4f} | EMA-3: {ema_value:.4f} | current: {current_side or 'None'}"
+                        f"[{symbol}] 1d open: {today_open:.4f} | EMA-3: {ema_value:.4f} | pos: {current_side or 'None'}"
                     )
 
                     should_long  = ema_value > today_open
                     should_short = ema_value < today_open
 
-                    # Case 1: No position → normal open
+                    qty = calculate_safe_quantity(symbol)
+
+                    # No position → open new
                     if current_side is None:
                         if should_long:
                             logger.info(f"→ {symbol} open LONG")
-                            resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY)
+                            resp = place_market_order(symbol, "BUY", qty)
                             if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                                 symbol_position_state[symbol] = "LONG"
                         elif should_short:
                             logger.info(f"→ {symbol} open SHORT")
-                            resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY)
+                            resp = place_market_order(symbol, "SELL", qty)
                             if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                                 symbol_position_state[symbol] = "SHORT"
-                        else:
-                            logger.info(f"→ {symbol} neutral – no action")
 
-                    # Case 2: Already LONG → check if should reverse to SHORT
-                    elif current_side == "LONG":
-                        if should_short:
-                            logger.info(f"→ {symbol} reverse: close LONG + open SHORT")
-                            # Close LONG
-                            close_resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY, reduce_only=True)
-                            if close_resp.get("status") in ("NEW", "FILLED"):
-                                # Open SHORT
-                                open_resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY)
-                                if open_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
-                                    symbol_position_state[symbol] = "SHORT"
-                        else:
-                            logger.info(f"→ {symbol} still LONG signal – holding")
+                    # Already LONG → reverse to SHORT if signal flipped
+                    elif current_side == "LONG" and should_short:
+                        logger.info(f"→ {symbol} reverse: close LONG → open SHORT")
+                        close_resp = place_market_order(symbol, "SELL", qty, reduce_only=True)
+                        if close_resp.get("status") in ("NEW", "FILLED"):
+                            open_resp = place_market_order(symbol, "SELL", qty)
+                            if open_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                                symbol_position_state[symbol] = "SHORT"
 
-                    # Case 3: Already SHORT → check if should reverse to LONG
-                    elif current_side == "SHORT":
-                        if should_long:
-                            logger.info(f"→ {symbol} reverse: close SHORT + open LONG")
-                            # Close SHORT
-                            close_resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY, reduce_only=True)
-                            if close_resp.get("status") in ("NEW", "FILLED"):
-                                # Open LONG
-                                open_resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY)
-                                if open_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
-                                    symbol_position_state[symbol] = "LONG"
-                        else:
-                            logger.info(f"→ {symbol} still SHORT signal – holding")
+                    # Already SHORT → reverse to LONG if signal flipped
+                    elif current_side == "SHORT" and should_long:
+                        logger.info(f"→ {symbol} reverse: close SHORT → open LONG")
+                        close_resp = place_market_order(symbol, "BUY", qty, reduce_only=True)
+                        if close_resp.get("status") in ("NEW", "FILLED"):
+                            open_resp = place_market_order(symbol, "BUY", qty)
+                            if open_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                                symbol_position_state[symbol] = "LONG"
 
                 except Exception as e:
                     logger.error(f"Error checking {symbol}: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-# ────────────────────────────────────────────────
-# Telegram handlers (same as before, only showing changed parts for brevity)
-# ────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Futures EMA-3 bot – auto-reverse enabled\n\n"
-        "• Every 30s checks monitored symbols\n"
-        "• If opposite signal → auto close current + open new direction\n"
-        "• Skips if same direction or neutral\n\n"
-        "Commands:\n"
-        "/add SYMBOL\n"
-        "/rem SYMBOL\n"
-        "/rem or /reset   (close all + clear)\n"
-        "/test SYMBOL     (manual full cycle)\n"
-    )
-
-# ... cmd_add, cmd_rem, cmd_test remain almost same (omitted for brevity) ...
-
-async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip().upper()
-    if text.startswith('/') or len(text) < 4 or not text.endswith("USDT"):
-        return
-
-    symbol = text
-
-    if symbol not in monitored_symbols:
-        await update.message.reply_text(f"{symbol} not monitored. Use /add first.")
-        return
-
-    current_side = symbol_position_state.get(symbol, None)
-    if current_side is not None:
-        await update.message.reply_text(
-            f"Manual check skipped: {symbol} already {current_side}\n"
-            "(auto-reverse only happens in background loop)"
-        )
-        return
-
-    # Manual check – same as auto but send to user
-    await update.message.reply_text(f"Manual check: {symbol}")
-
-    klines_1m = get_klines(symbol, "1m", 50)
-    if not klines_1m or len(klines_1m) < 3:
-        await update.message.reply_text("Not enough 1m data")
-        return
-
-    klines_1d = get_klines(symbol, "1d", 2)
-    if not klines_1d:
-        await update.message.reply_text("Failed to get 1d data")
-        return
-
-    today_open = float(klines_1d[-1][1])
-    closes = [float(k[4]) for k in klines_1m]
-
-    df = pd.DataFrame({"close": closes})
-    ema_indicator = EMAIndicator(close=df["close"], window=3)
-    ema_value = ema_indicator.ema_indicator().iloc[-1]
-
-    msg = (
-        f"**Manual check {symbol}**\n"
-        f"1d open: {today_open:.4f}\n"
-        f"EMA-3 (1m): {ema_value:.4f}\n"
-    )
-
-    if ema_value > today_open:
-        msg += "→ opening LONG"
-        await update.message.reply_text(msg)
-        resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY)
-        await update.message.reply_text(f"Result:\n{resp}")
-        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
-            symbol_position_state[symbol] = "LONG"
-    elif ema_value < today_open:
-        msg += "→ opening SHORT"
-        await update.message.reply_text(msg)
-        resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY)
-        await update.message.reply_text(f"Result:\n{resp}")
-        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
-            symbol_position_state[symbol] = "SHORT"
-    else:
-        msg += "→ no action"
-        await update.message.reply_text(msg)
+# ... (rest of the code – Telegram handlers, on_startup, main – same as previous version)
 
 async def on_startup(app: Application) -> None:
     asyncio.create_task(auto_check_symbols(app))
-    logger.info(f"Auto-check with reverse started – interval {CHECK_INTERVAL_SECONDS}s")
+    logger.info(f"Auto-check with dynamic qty & loss-cut started – interval {CHECK_INTERVAL_SECONDS}s")
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()

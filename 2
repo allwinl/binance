@@ -18,12 +18,12 @@ except ImportError:
 import config  # needs API_KEY, API_SECRET
 
 # ─── Config ─────────────────────────────────────────────────────────────────
-TEST_MODE           = True          # set to False to stop the loop
+TEST_MODE           = True
 SYMBOL              = "XRPUSDT"
 TEST_QUANTITY       = 5.0
 LEVERAGE            = 5
 SLEEP_SECONDS       = 20
-ORDER_CONFIRM_DELAY = 10.0          # increased from 6s → more reliable fill detection
+ORDER_CONFIRM_DELAY = 10.0
 
 logging.basicConfig(
     filename='balance_margin_debug.log',
@@ -50,34 +50,42 @@ def print_account_status():
     try:
         response = client.rest_api.account_information_v3()
         
-        # Most common pattern in recent Binance SDKs
-        if hasattr(response, 'data') and callable(getattr(response, 'data')):
-            account = response.data()
-        else:
-            account = response  # fallback - might already be dict
+        # response is AccountInformationV3Response object
         
-        print("\nDEBUG: account response type →", type(account))
+        print("\nDEBUG: Account response type →", type(response))
+        print("DEBUG: Has 'assets' attribute →", hasattr(response, 'assets'))
         
         usdt_info = None
-        assets = account.get('assets', []) if isinstance(account, dict) else []
-        for asset in assets:
-            if asset.get('asset') == 'USDT':
+        assets_list = getattr(response, 'assets', [])
+        print("DEBUG: Number of assets →", len(assets_list))
+        
+        for asset in assets_list:
+            asset_name = getattr(asset, 'asset', '')
+            if asset_name == 'USDT':
                 usdt_info = asset
                 break
 
         if usdt_info:
             print("\nFutures USDT Status:")
-            print(f"  Wallet Balance:     {usdt_info.get('walletBalance', 'N/A')}")
-            print(f"  Available Balance:  {usdt_info.get('availableBalance', 'N/A')}")
-            print(f"  Unrealized PnL:     {usdt_info.get('unrealizedProfit', 'N/A')}")
-            print(f"  Margin Balance:     {usdt_info.get('marginBalance', 'N/A')}")
+            print(f"  Wallet Balance:     {getattr(usdt_info, 'walletBalance', 'N/A')}")
+            print(f"  Available Balance:  {getattr(usdt_info, 'availableBalance', 'N/A')}")
+            print(f"  Unrealized PnL:     {getattr(usdt_info, 'unrealizedProfit', 'N/A')}")
+            print(f"  Margin Balance:     {getattr(usdt_info, 'marginBalance', 'N/A')}")
+            # Extra fields from official docs
+            print(f"  Initial Margin:     {getattr(usdt_info, 'initialMargin', 'N/A')}")
+            print(f"  Maint. Margin:      {getattr(usdt_info, 'maintMargin', 'N/A')}")
         else:
-            print("No USDT asset found in account response")
+            print("No USDT asset found in assets list. Available assets:")
+            for a in assets_list:
+                print(f"  - {getattr(a, 'asset', 'UNKNOWN')}")
 
-        # Margin / risk fields
-        print(f"Margin Ratio:          {account.get('marginRatio', 'N/A')}")
-        print(f"Total Maint. Margin:   {account.get('totalMaintMargin', 'N/A')}")
-        print(f"Total Wallet Balance:  {account.get('totalWalletBalance', 'N/A')}")
+        # Top-level fields
+        print(f"\nMargin Ratio:             {getattr(response, 'marginRatio', 'N/A')}")
+        print(f"Total Maint. Margin:      {getattr(response, 'totalMaintMargin', 'N/A')}")
+        print(f"Total Wallet Balance:     {getattr(response, 'totalWalletBalance', 'N/A')}")
+        print(f"Total Unrealized PnL:     {getattr(response, 'totalUnrealizedProfit', 'N/A')}")
+        print(f"Total Margin Balance:     {getattr(response, 'totalMarginBalance', 'N/A')}")
+        print(f"Available Balance (global): {getattr(response, 'availableBalance', 'N/A')}")
 
     except Exception as e:
         print(f"Account info failed: {str(e)}")
@@ -136,9 +144,8 @@ def market_order(symbol, side_enum, quantity: float):
         print("Quantity too small – skipping")
         return None
 
-    qty = round(abs(quantity), 0)  # XRPUSDT stepSize = 1
+    qty = round(abs(quantity), 0)
 
-    # Safety: show account before sending
     print_account_status()
 
     params = {

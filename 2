@@ -1,5 +1,5 @@
 # bot.py
-# Binance USDS-M Futures – LONG/SHORT test + BALANCE + MARGIN DIAGNOSTICS
+# Binance USDS-M Futures – Simple LONG ↔ SHORT flip test
 # XRPUSDT – VERY SMALL SIZE – REAL MONEY – EXTREME CAUTION
 
 import time
@@ -18,24 +18,24 @@ except ImportError:
 import config  # needs API_KEY, API_SECRET
 
 # ─── Config ─────────────────────────────────────────────────────────────────
-TEST_MODE           = True
-SYMBOL              = "XRPUSDT"
-TEST_QUANTITY       = 5.0
-LEVERAGE            = 5
-SLEEP_SECONDS       = 20
-ORDER_CONFIRM_DELAY = 10.0
+RUN_LOOP         = True             # set False to stop
+SYMBOL           = "XRPUSDT"
+QUANTITY         = 5.0
+LEVERAGE         = 5
+SLEEP_AFTER_CYCLE = 20              # seconds between full cycles
+ORDER_WAIT       = 10.0             # seconds to wait after order for position update
 
 logging.basicConfig(
-    filename='balance_margin_debug.log',
-    level=logging.DEBUG,
+    filename='flip_test.log',
+    level=logging.INFO,
     format='%(asctime)s | %(levelname)-5s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S UTC'
 )
 logger = logging.getLogger(__name__)
 
-print(">>> LIVE TRADING CODE – REAL MONEY – EXTREME CAUTION <<<")
-print(">>> Sequence: LONG → close → SHORT → close + balance/margin debug <<<")
-logger.critical("BOT STARTED – BALANCE & MARGIN DEBUG – REAL MONEY")
+print(">>> LIVE TRADING – REAL MONEY – EXTREME CAUTION <<<")
+print(f">>> Flip test: LONG → SHORT → LONG → SHORT... | {SYMBOL} @ {LEVERAGE}x | qty {QUANTITY} <<<")
+logger.info("BOT STARTED – SIMPLE LONG/SHORT FLIP TEST")
 
 configuration = ConfigurationRestAPI(
     api_key=config.API_KEY,
@@ -44,109 +44,48 @@ configuration = ConfigurationRestAPI(
 )
 client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
-# ─── Account Status ─────────────────────────────────────────────────────────
-
-def print_account_status():
-    try:
-        response = client.rest_api.account_information_v3()
-        
-        # response is AccountInformationV3Response object
-        
-        print("\nDEBUG: Account response type →", type(response))
-        print("DEBUG: Has 'assets' attribute →", hasattr(response, 'assets'))
-        
-        usdt_info = None
-        assets_list = getattr(response, 'assets', [])
-        print("DEBUG: Number of assets →", len(assets_list))
-        
-        for asset in assets_list:
-            asset_name = getattr(asset, 'asset', '')
-            if asset_name == 'USDT':
-                usdt_info = asset
-                break
-
-        if usdt_info:
-            print("\nFutures USDT Status:")
-            print(f"  Wallet Balance:     {getattr(usdt_info, 'walletBalance', 'N/A')}")
-            print(f"  Available Balance:  {getattr(usdt_info, 'availableBalance', 'N/A')}")
-            print(f"  Unrealized PnL:     {getattr(usdt_info, 'unrealizedProfit', 'N/A')}")
-            print(f"  Margin Balance:     {getattr(usdt_info, 'marginBalance', 'N/A')}")
-            # Extra fields from official docs
-            print(f"  Initial Margin:     {getattr(usdt_info, 'initialMargin', 'N/A')}")
-            print(f"  Maint. Margin:      {getattr(usdt_info, 'maintMargin', 'N/A')}")
-        else:
-            print("No USDT asset found in assets list. Available assets:")
-            for a in assets_list:
-                print(f"  - {getattr(a, 'asset', 'UNKNOWN')}")
-
-        # Top-level fields
-        print(f"\nMargin Ratio:             {getattr(response, 'marginRatio', 'N/A')}")
-        print(f"Total Maint. Margin:      {getattr(response, 'totalMaintMargin', 'N/A')}")
-        print(f"Total Wallet Balance:     {getattr(response, 'totalWalletBalance', 'N/A')}")
-        print(f"Total Unrealized PnL:     {getattr(response, 'totalUnrealizedProfit', 'N/A')}")
-        print(f"Total Margin Balance:     {getattr(response, 'totalMarginBalance', 'N/A')}")
-        print(f"Available Balance (global): {getattr(response, 'availableBalance', 'N/A')}")
-
-    except Exception as e:
-        print(f"Account info failed: {str(e)}")
-        logger.error(f"Account info failed: {str(e)}", exc_info=True)
-
-
-# ─── Position query ─────────────────────────────────────────────────────────
+# ─── Helpers ────────────────────────────────────────────────────────────────
 
 def get_position(symbol):
     qty = 0.0
-    raw_data = None
     used_endpoint = "none"
 
-    for endpoint_name in ['position_information_v3', 'position_information_v2']:
+    for ep in ['position_information_v3', 'position_information_v2']:
         try:
-            method = getattr(client.rest_api, endpoint_name)
+            method = getattr(client.rest_api, ep)
             resp = method(symbol=symbol)
-
             data = resp.data() if hasattr(resp, 'data') and callable(getattr(resp, 'data')) else resp
-            raw_data = data
-            used_endpoint = endpoint_name
-            logger.debug(f"{endpoint_name} raw data: {data}")
 
             if isinstance(data, list):
                 for pos in data:
                     if pos.get('symbol') == symbol:
-                        amt_str = pos.get('positionAmt', '0')
-                        qty = float(amt_str)
-                        logger.info(f"{endpoint_name} → positionAmt = {amt_str}")
+                        qty = float(pos.get('positionAmt', '0'))
+                        used_endpoint = ep
                         break
-
             if qty != 0.0:
                 break
-
         except Exception as e:
-            logger.error(f"{endpoint_name} failed: {e}")
+            logger.error(f"{ep} failed: {e}")
 
-    print(f"Detected position: {qty:+.2f} (from {used_endpoint})")
-    if raw_data is not None:
-        print(f"Raw positions data: {raw_data}")
-
+    print(f"Position: {qty:+.1f}  (from {used_endpoint})")
     return qty
 
 
 def set_leverage(symbol, lev):
     try:
         client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
-        logger.info(f"Leverage set → {lev}x")
-        print(f"Leverage set → {lev}x")
+        print(f"Leverage set to {lev}x")
+        logger.info(f"Leverage set to {lev}x")
     except Exception as e:
-        logger.warning(f"Leverage set failed (maybe already set?): {e}")
+        print(f"Leverage set warning: {e}")
+        logger.warning(f"Leverage: {e}")
 
 
-def market_order(symbol, side_enum, quantity: float):
-    if abs(quantity) < 0.1:
-        print("Quantity too small – skipping")
-        return None
-
-    qty = round(abs(quantity), 0)
-
-    print_account_status()
+def send_market_order(symbol, side_enum, qty_float: float):
+    qty = round(abs(qty_float), 0)
+    if qty < 1:
+        print("Quantity too small – skip")
+        return False
 
     params = {
         "symbol": symbol,
@@ -157,132 +96,60 @@ def market_order(symbol, side_enum, quantity: float):
 
     try:
         response = client.rest_api.new_order(**params)
-
         data = response.data() if hasattr(response, 'data') and callable(getattr(response, 'data')) else response
-        logger.info(f"new_order response: {data}")
 
-        msg = f"ORDER SUCCESS → {side_enum.name} {qty} {symbol}"
         order_id = data.get('orderId') if isinstance(data, dict) else getattr(data, 'orderId', None)
-        if order_id:
-            msg += f"  ID: {order_id}"
-        print(msg)
+        print(f"ORDER OK → {side_enum.name} {qty} {symbol}  (ID: {order_id or 'N/A'})")
+        logger.info(f"Order success: {side_enum.name} {qty} {symbol}")
 
-        print(f"Order sent → waiting {ORDER_CONFIRM_DELAY}s for position update...")
-        time.sleep(ORDER_CONFIRM_DELAY)
-
-        print("\nAfter order:")
-        print_account_status()
-
-        return response
+        print(f"Waiting {ORDER_WAIT}s for fill...")
+        time.sleep(ORDER_WAIT)
+        return True
 
     except Exception as e:
-        logger.error(f"order failed: {e}")
         print(f"ORDER FAILED: {e}")
-        return None
+        logger.error(f"Order failed: {e}")
+        return False
 
 
-# ─── Actions ────────────────────────────────────────────────────────────────
-
-def open_long():
-    print("→ Opening LONG")
-    return market_order(SYMBOL, NewOrderSideEnum["BUY"], TEST_QUANTITY)
-
-
-def close_long(current_qty):
-    if current_qty <= 0:
-        print("No LONG position to close")
-        return None
-    print(f"→ Closing LONG ({current_qty:.1f})")
-    return market_order(SYMBOL, NewOrderSideEnum["SELL"], current_qty)
-
-
-def open_short():
-    print("→ Opening SHORT")
-    return market_order(SYMBOL, NewOrderSideEnum["SELL"], TEST_QUANTITY)
-
-
-def close_short(current_qty):
-    if current_qty >= 0:
-        print("No SHORT position to close")
-        return None
-    print(f"→ Closing SHORT ({abs(current_qty):.1f})")
-    return market_order(SYMBOL, NewOrderSideEnum["BUY"], abs(current_qty))
-
-
-# ─── State machine ──────────────────────────────────────────────────────────
-
-last_phase = "start"
-
-def run_test_cycle():
-    global last_phase
-
-    position_qty = get_position(SYMBOL)
-
-    if position_qty == 0:
-        if last_phase in ["start", "closed_long", "closed_short"]:
-            print("Flat → opening LONG")
-            resp = open_long()
-            if resp:
-                last_phase = "opened_long"
-        elif last_phase == "closed_long":
-            print("Just closed LONG → opening SHORT")
-            resp = open_short()
-            if resp:
-                last_phase = "opened_short"
-
-    elif position_qty > 0:
-        if last_phase == "opened_long":
-            print("LONG opened → closing it")
-            resp = close_long(position_qty)
-            if resp:
-                last_phase = "closed_long"
-        else:
-            print("LONG detected unexpectedly → closing")
-            resp = close_long(position_qty)
-            if resp:
-                last_phase = "closed_long"
-
-    elif position_qty < 0:
-        if last_phase == "opened_short":
-            print("SHORT opened → closing it")
-            resp = close_short(position_qty)
-            if resp:
-                last_phase = "closed_short"
-        else:
-            print("SHORT detected unexpectedly → closing")
-            resp = close_short(position_qty)
-            if resp:
-                last_phase = "closed_short"
-
-
-# ─── Main ───────────────────────────────────────────────────────────────────
+# ─── Main Cycle ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"Starting cycle: LONG → close → SHORT → close  |  {SYMBOL} @ {LEVERAGE}x")
-    logger.critical(f"TEST STARTED – {SYMBOL} – REAL MONEY – BALANCE/MARGIN DEBUG")
-
     set_leverage(SYMBOL, LEVERAGE)
 
-    print("\nInitial account status:")
-    print_account_status()
+    current_direction = "FLAT"  # or "LONG" / "SHORT" – we detect from position
 
     cycle = 0
 
-    while TEST_MODE:
+    while RUN_LOOP:
         cycle += 1
-        now_utc = datetime.now(timezone.utc)
-        print(f"\n=== Test cycle {cycle} at {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
-        try:
-            run_test_cycle()
-        except KeyboardInterrupt:
-            print("\nStopped by user.")
-            logger.info("Stopped by user")
-            break
-        except Exception as e:
-            logger.critical(f"MAIN LOOP ERROR: {e}", exc_info=True)
-            print(f"CRITICAL ERROR: {e}")
-            time.sleep(30)
+        print(f"\n=== Cycle {cycle} at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
 
-        time.sleep(SLEEP_SECONDS)
+        pos_qty = get_position(SYMBOL)
 
-    print("Test mode stopped.")
+        if pos_qty > 0:
+            current_direction = "LONG"
+            print(f"Closing LONG + opening SHORT (sell {QUANTITY})")
+            success = send_market_order(SYMBOL, NewOrderSideEnum["SELL"], QUANTITY)
+
+        elif pos_qty < 0:
+            current_direction = "SHORT"
+            print(f"Closing SHORT + opening LONG (buy {QUANTITY})")
+            success = send_market_order(SYMBOL, NewOrderSideEnum["BUY"], QUANTITY)
+
+        else:  # flat – start with LONG
+            print(f"Flat → opening LONG (buy {QUANTITY})")
+            success = send_market_order(SYMBOL, NewOrderSideEnum["BUY"], QUANTITY)
+
+        # Optional: quick re-check position after wait
+        time.sleep(2)
+        new_pos = get_position(SYMBOL)
+        print(f"After cycle: position {new_pos:+.1f}")
+
+        # You can uncomment if you want minimal balance check later
+        # print_account_status()  # ← define a minimal version if needed
+
+        time.sleep(SLEEP_AFTER_CYCLE)
+
+    print("Loop stopped.")
+    logger.info("BOT STOPPED")

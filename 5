@@ -10,6 +10,9 @@ from urllib.parse import urlencode
 import math
 import sys
 
+# ─── Fix: import Optional ────────────────────────────────────────────────
+from typing import Dict, Any, Optional
+
 try:
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
@@ -26,7 +29,7 @@ API_SECRET  = binance_cfg.get("api_secret")
 SYMBOL           = trading_cfg.get("symbol", "BTCUSDT")
 LEVERAGE         = trading_cfg.get("leverage", 5)
 MARGIN_TYPE      = trading_cfg.get("margin_type", "ISOLATED").upper()
-DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 20.0)  # increased default for XRPUSDT
+DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 20.0)  # reasonable for XRPUSDT
 
 if not API_KEY or not API_SECRET:
     print("ERROR: api_key/api_secret missing")
@@ -55,7 +58,7 @@ def signed_request(method: str, endpoint: str, params: Optional[dict] = None, ma
             elif method.upper() == "POST":
                 r = requests.post(url, headers=HEADERS, timeout=10)
             else:
-                raise ValueError("Bad method")
+                raise ValueError("Unsupported method")
 
             r.raise_for_status()
             data = r.json()
@@ -71,9 +74,9 @@ def signed_request(method: str, endpoint: str, params: Optional[dict] = None, ma
                     continue
             return data
         except Exception as e:
-            print(f"Request failed (try {attempt}): {e}")
+            print(f"Request failed (attempt {attempt}): {e}")
             time.sleep(attempt * 2)
-    return {"error": "max retries"}
+    return {"error": "max retries exceeded"}
 
 def load_symbol_info():
     global symbol_precision, symbol_filters
@@ -96,9 +99,9 @@ def load_symbol_info():
                 print(f"Loaded {SYMBOL}: qty prec={symbol_precision['quantity']}, price prec={symbol_precision['price']}")
                 print(f"  minQty={symbol_filters.get('minQty')}, stepSize={symbol_filters.get('stepSize')}")
                 if "minNotional" in symbol_filters:
-                    print(f"  minNotional≈{symbol_filters['minNotional']} USDT")
+                    print(f"  minNotional ≈ {symbol_filters['minNotional']} USDT")
                 return
-        print("Symbol not found → using defaults")
+        print("Symbol not found in exchangeInfo → using defaults")
     except Exception as e:
         print(f"exchangeInfo failed: {e}")
 
@@ -108,15 +111,16 @@ def format_qty(qty: float) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 def confirm_action(msg: str) -> bool:
-    ans = input(f"{msg}\nReally execute? [y/N]: ").strip().lower()
-    return ans in ("y", "yes")
+    ans = input(f"{msg}\nReally execute? [y/N] ").strip().lower()
+    return ans in ("y", "yes", "y ")
 
-def market_order(side: str, qty: float = None, reduce_only: bool = False) -> dict:
+def market_order(side: str, qty: Optional[float] = None, reduce_only: bool = False) -> dict:
     qty = qty or DEFAULT_QUANTITY
     qty_str = format_qty(qty)
 
-    if not confirm_action(f"Sending MARKET {side.upper()} {qty_str} {SYMBOL} (reduceOnly={reduce_only})"):
-        print("Cancelled by user.")
+    prompt = f"Sending MARKET {side.upper()} {qty_str} {SYMBOL} (reduceOnly={reduce_only})"
+    if not confirm_action(prompt):
+        print("Order cancelled by user.")
         return {"cancelled": True}
 
     params = {
@@ -128,7 +132,7 @@ def market_order(side: str, qty: float = None, reduce_only: bool = False) -> dic
     if reduce_only:
         params["reduceOnly"] = "true"
 
-    print(f"→ Executing: MARKET {side.upper()} {qty_str} {SYMBOL}")
+    print(f"→ Sending order...")
     return signed_request("POST", "/fapi/v1/order", params)
 
 def get_usdt_balance() -> float:
@@ -158,9 +162,9 @@ def setup_symbol():
     print("\nSetting margin type...")
     print(signed_request("POST", "/fapi/v1/marginType", {"symbol": SYMBOL, "marginType": MARGIN_TYPE}))
 
-def long_cycle(qty=None):
+def long_cycle(qty: Optional[float] = None):
     if get_position_mode() == "HEDGE":
-        print("Hedge mode detected → cycle commands expect One-way mode")
+        print("Hedge mode detected — cycle assumes One-way mode")
         return
     qty = qty or DEFAULT_QUANTITY
     print("=== LONG cycle ===")
@@ -178,9 +182,9 @@ def long_cycle(qty=None):
     else:
         print("No LONG position detected after open")
 
-def short_cycle(qty=None):
+def short_cycle(qty: Optional[float] = None):
     if get_position_mode() == "HEDGE":
-        print("Hedge mode detected → cycle commands expect One-way mode")
+        print("Hedge mode detected — cycle assumes One-way mode")
         return
     qty = qty or DEFAULT_QUANTITY
     print("=== SHORT cycle ===")
@@ -203,18 +207,18 @@ def print_help():
 Loaded {SYMBOL}: qty prec={symbol_precision['quantity']}, price prec={symbol_precision['price']}
 minQty={symbol_filters.get('minQty')}, stepSize={symbol_filters.get('stepSize')}
 
-Real Binance Futures Commands (symbol={SYMBOL}):
+Commands:
 
-  python bot.py balance           → show available USDT
-  python bot.py positions         → show current positions
+  python bot.py balance           → available USDT
+  python bot.py positions         → current positions
   python bot.py setup             → set leverage + margin type
-  python bot.py buy  [qty]        → MARKET LONG / BUY (open)
-  python bot.py sell [qty]        → MARKET SHORT / SELL (open)
+  python bot.py buy  [qty]        → MARKET LONG (open)
+  python bot.py sell [qty]        → MARKET SHORT (open)
   python bot.py long_cycle  [qty] → open LONG → close LONG
   python bot.py short_cycle [qty] → open SHORT → close SHORT
-  python bot.py time              → show server time
-  python bot.py precision         → show quantity & price precision
-  python bot.py mode              → show current position mode (One-way / Hedge)
+  python bot.py time              → server time
+  python bot.py precision         → qty & price precision
+  python bot.py mode              → position mode (One-way / Hedge)
 
 No arguments → this help
 """)
@@ -231,8 +235,7 @@ if __name__ == "__main__":
     qty_arg = float(args[1]) if len(args) > 1 else None
 
     if cmd == "balance":
-        bal = get_usdt_balance()
-        print(f"Available USDT: {bal:.2f}")
+        print(f"Available USDT: {get_usdt_balance():.2f}")
 
     elif cmd == "positions":
         positions = signed_request("GET", "/fapi/v2/positionRisk")
@@ -243,17 +246,16 @@ if __name__ == "__main__":
             for p in active:
                 amt = float(p["positionAmt"])
                 side = "LONG" if amt > 0 else "SHORT"
-                print(f"{p['symbol']} | {side} | amt: {amt:.{symbol_precision['quantity']}f} | "
-                      f"unrealized PnL: {float(p['unRealizedProfit']):+.2f}")
+                print(f"{p['symbol']} | {side} | amt: {amt:.{symbol_precision['quantity']}f} | PnL: {float(p['unRealizedProfit']):+.2f}")
 
     elif cmd == "setup":
         setup_symbol()
 
     elif cmd == "buy":
-        print(market_order("BUY", qty_arg, reduce_only=False))
+        print(market_order("BUY", qty_arg, False))
 
     elif cmd == "sell":
-        print(market_order("SELL", qty_arg, reduce_only=False))
+        print(market_order("SELL", qty_arg, False))
 
     elif cmd == "long_cycle":
         long_cycle(qty_arg)
@@ -267,14 +269,12 @@ if __name__ == "__main__":
         print(f"Server time: {ts} ms → {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(ts / 1000))}")
 
     elif cmd == "precision":
-        print(f"Quantity precision: {symbol_precision['quantity']} decimals")
-        print(f"Price precision:    {symbol_precision['price']} decimals")
+        print(f"Qty precision: {symbol_precision['quantity']} decimals")
+        print(f"Price precision: {symbol_precision['price']} decimals")
 
     elif cmd == "mode":
         mode = get_position_mode()
         print(f"Position mode: {mode}")
-        if mode == "HEDGE":
-            print("→ Hedge mode active: must use positionSide=LONG/SHORT on orders")
 
     else:
         print(f"Unknown command: {cmd}")

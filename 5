@@ -1,7 +1,5 @@
 # bot.py
 # Binance USDS-M Futures Telegram bot – single file
-# Commands: /add SYMBOL, /rem SYMBOL, /rem or /reset, plain symbol → check & trade
-# New: /test SYMBOL → small test cycle LONG → close → SHORT → close
 
 import asyncio
 import logging
@@ -45,7 +43,7 @@ TELEGRAM_TOKEN = telegram_cfg.get("token")
 
 LEVERAGE         = trading_cfg.get("leverage", 5)
 MARGIN_TYPE      = trading_cfg.get("margin_type", "ISOLATED").upper()
-DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 0.001)  # fallback only
+DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 0.001)
 
 if not API_KEY or not API_SECRET or not TELEGRAM_TOKEN:
     print("ERROR: Missing api_key, api_secret or telegram token")
@@ -60,8 +58,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global set of monitored symbols
+# ────────────────────────────────────────────────
+# State
+# ────────────────────────────────────────────────
+
 monitored_symbols: Set[str] = set()
+
+# "LONG", "SHORT" or None
+symbol_position_state: Dict[str, Optional[str]] = {}
 
 # ────────────────────────────────────────────────
 # Binance helpers
@@ -150,20 +154,17 @@ def calculate_test_quantity(symbol: str) -> float:
     if price <= 0:
         return 0.0
 
-    # target notional = min_notional * 1.05
     target_notional = min_notional * 1.05
     raw_qty = target_notional / price
 
-    # round up to next valid step
     steps = math.ceil(raw_qty / step_size)
     final_qty = steps * step_size
 
-    # at least minQty
     final_qty = max(final_qty, filters.get("minQty", 0.1))
 
-    return round(final_qty, 6)  # safety
+    return round(final_qty, 6)
 
-def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False):
+def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False) -> Dict:
     if qty <= 0:
         return {"error": "Invalid quantity"}
 
@@ -196,6 +197,11 @@ def close_all_positions():
         side = "SELL" if amt > 0 else "BUY"
         qty = abs(amt)
         resp = place_market_order(sym, side, qty, reduce_only=True)
+
+        # Clear state after close
+        if resp.get("status") in ("FILLED", "NEW"):
+            symbol_position_state[sym] = None
+
         closed.append((sym, resp))
 
     return closed
@@ -230,6 +236,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"{sym} already monitored")
         else:
             monitored_symbols.add(sym)
+            symbol_position_state.setdefault(sym, None)
             await update.message.reply_text(
                 f"Added {sym}\n"
                 f"Current list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
@@ -239,9 +246,9 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        # clear all + close positions
         old_list = sorted(monitored_symbols)
         monitored_symbols.clear()
+        symbol_position_state.clear()
 
         closed = close_all_positions()
 
@@ -262,6 +269,7 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sym = context.args[0].strip().upper()
     if sym in monitored_symbols:
         monitored_symbols.remove(sym)
+        symbol_position_state.pop(sym, None)
         await update.message.reply_text(
             f"Removed {sym}\n"
             f"Current list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
@@ -290,35 +298,47 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         f"Test cycle on {sym}\n"
-        f"Calculated quantity: {qty:.6f}  (~5% above min notional)\n"
+        f"Quantity: {qty:.6f} (~5% above min notional)\n"
         "Starting LONG → close → SHORT → close ...\n"
     )
 
     # LONG open
     await update.message.reply_text("1/4 Opening LONG...")
     open_long = place_market_order(sym, "BUY", qty)
-    await update.message.reply_text(f"Open LONG: {open_long.get('status', 'unknown')} {open_long.get('orderId', '')}")
+    status = open_long.get('status', 'unknown')
+    await update.message.reply_text(f"Open LONG: {status} {open_long.get('orderId', '')}")
+    if status in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+        symbol_position_state[sym] = "LONG"
 
     await asyncio.sleep(4)
 
     # LONG close
     await update.message.reply_text("2/4 Closing LONG...")
     close_long = place_market_order(sym, "SELL", qty, reduce_only=True)
-    await update.message.reply_text(f"Close LONG: {close_long.get('status', 'unknown')} {close_long.get('orderId', '')}")
+    status_close = close_long.get('status', 'unknown')
+    await update.message.reply_text(f"Close LONG: {status_close} {close_long.get('orderId', '')}")
+    if status_close in ("NEW", "FILLED"):
+        symbol_position_state[sym] = None
 
     await asyncio.sleep(3)
 
     # SHORT open
     await update.message.reply_text("3/4 Opening SHORT...")
     open_short = place_market_order(sym, "SELL", qty)
-    await update.message.reply_text(f"Open SHORT: {open_short.get('status', 'unknown')} {open_short.get('orderId', '')}")
+    status_s = open_short.get('status', 'unknown')
+    await update.message.reply_text(f"Open SHORT: {status_s} {open_short.get('orderId', '')}")
+    if status_s in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+        symbol_position_state[sym] = "SHORT"
 
     await asyncio.sleep(4)
 
     # SHORT close
     await update.message.reply_text("4/4 Closing SHORT...")
     close_short = place_market_order(sym, "BUY", qty, reduce_only=True)
-    await update.message.reply_text(f"Close SHORT: {close_short.get('status', 'unknown')} {close_short.get('orderId', '')}")
+    status_cs = close_short.get('status', 'unknown')
+    await update.message.reply_text(f"Close SHORT: {status_cs} {close_short.get('orderId', '')}")
+    if status_cs in ("NEW", "FILLED"):
+        symbol_position_state[sym] = None
 
     await update.message.reply_text("Test cycle finished.")
 
@@ -341,7 +361,14 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    # normal EMA logic
+    current_side = symbol_position_state.get(symbol, None)
+    if current_side is not None:
+        await update.message.reply_text(
+            f"Already have open position on {symbol}: {current_side}\n"
+            "Will not open duplicate. Send /test if you want to force cycle."
+        )
+        return
+
     await update.message.reply_text(f"Checking {symbol}...")
 
     klines_1m = get_klines(symbol, "1m", 50)
@@ -359,20 +386,28 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
     df = pd.DataFrame({"close": closes})
     ema9 = df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
 
-    msg = f"{symbol}\n1d open: {today_open:.4f}\nEMA-9 (1m): {ema9:.4f}\n"
+    msg = (
+        f"{symbol}\n"
+        f"1d open price: {today_open:.4f}\n"
+        f"EMA-9 (1m) value: {ema9:.4f}\n"
+    )
 
     if ema9 > today_open:
-        msg += "→ opening LONG"
+        msg += "→ EMA9 > 1d open → opening LONG"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY)
-        await update.message.reply_text(f"Result: {resp}")
+        await update.message.reply_text(f"Order result:\n{resp}")
+        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+            symbol_position_state[symbol] = "LONG"
     elif ema9 < today_open:
-        msg += "→ opening SHORT"
+        msg += "→ EMA9 < 1d open → opening SHORT"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY)
-        await update.message.reply_text(f"Result: {resp}")
+        await update.message.reply_text(f"Order result:\n{resp}")
+        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+            symbol_position_state[symbol] = "SHORT"
     else:
-        msg += "→ no action (equal)"
+        msg += "→ EMA9 == 1d open → no action"
         await update.message.reply_text(msg)
 
 def main() -> None:
@@ -386,6 +421,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_symbol_message))
 
     print("Bot started. Monitored:", monitored_symbols)
+    print("Position states:", symbol_position_state)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

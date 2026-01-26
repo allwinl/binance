@@ -1,98 +1,262 @@
-import ccxt
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+# bot.py
+# Binance USDS-M Futures bot – REAL MAINNET version – single file
+# Uses official REST API only – no unofficial libraries
+
 import requests
-from scipy.signal import argrelextrema
-from scipy.stats import linregress
+import time
+import hmac
+import hashlib
+import yaml
+from urllib.parse import urlencode
+from typing import Dict, Any, Optional
 
-# ✅ 1️⃣ Fetch Data from Binance
-exchange = ccxt.binance()
-symbol = 'BTC/USDT'
-timeframe = '4h'
-limit = 500
+# ────────────────────────────────────────────────
+# Load configuration (real mainnet)
+# ────────────────────────────────────────────────
 
-ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+try:
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f)
+except FileNotFoundError:
+    print("ERROR: config.yaml not found in current directory")
+    exit(1)
 
-# ✅ 2️⃣ Identify Pivot Highs and Lows
-lookback = 4  # Lookback range for detecting swings
+binance_cfg = config.get("binance", {})
+trading_cfg = config.get("trading", {})
 
-df['pivot_high'] = np.nan
-df['pivot_low'] = np.nan
+API_KEY     = binance_cfg.get("api_key")
+API_SECRET  = binance_cfg.get("api_secret")
 
-high_idxs = argrelextrema(df['close'].values, np.greater, order=lookback)[0]
-low_idxs = argrelextrema(df['close'].values, np.less, order=lookback)[0]
+SYMBOL           = trading_cfg.get("symbol", "BTCUSDT")
+LEVERAGE         = trading_cfg.get("leverage", 5)
+MARGIN_TYPE      = trading_cfg.get("margin_type", "ISOLATED").upper()
+DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 0.001)
 
-df.loc[high_idxs, 'pivot_high'] = df['close'].iloc[high_idxs]
-df.loc[low_idxs, 'pivot_low'] = df['close'].iloc[low_idxs]
+if not API_KEY or not API_SECRET:
+    print("ERROR: api_key and/or api_secret missing in config.yaml")
+    exit(1)
 
-# ✅ 3️⃣ Store Trendlines (Minimum 2 Points)
-trendlines = []
+BASE_URL = "https://fapi.binance.com"
+HEADERS  = {"X-MBX-APIKEY": API_KEY}
 
-def add_trendline(x_vals, y_vals, trend_type):
-    """Adds a straight x-line trendline between two points."""
-    if len(x_vals) < 2:
-        return None
-    slope, intercept, _, _, _ = linregress(x_vals, y_vals)
-    y_start = slope * x_vals[0] + intercept
-    y_end = slope * x_vals[-1] + intercept
-    trendlines.append({'x_start': x_vals[0], 'x_end': df.index[-1], 
-                       'y': y_end, 'type': trend_type})  # Extend to latest candle
+# Cache for symbol precision
+symbol_precision = {"quantity": 3, "price": 2}  # fallback defaults
 
-# ✅ 4️⃣ Detect and Store Pivot-Based Trendlines
-pivot_highs = df.dropna(subset=['pivot_high'])
-pivot_lows = df.dropna(subset=['pivot_low'])
+# ────────────────────────────────────────────────
+# Core signed request function
+# ────────────────────────────────────────────────
 
-if len(pivot_highs) > 1:
-    add_trendline(pivot_highs.index.values[-2:], pivot_highs['pivot_high'].values[-2:], 'resistance')
+def signed_request(method: str,
+                   endpoint: str,
+                   params: Optional[Dict] = None,
+                   max_retries: int = 3) -> Dict:
 
-if len(pivot_lows) > 1:
-    add_trendline(pivot_lows.index.values[-2:], pivot_lows['pivot_low'].values[-2:], 'support')
+    if params is None:
+        params = {}
 
-# ✅ 5️⃣ Detect Breakouts
-last_close = df['close'].iloc[-1]
-breakout = None
+    params["timestamp"]  = int(time.time() * 1000)
+    params["recvWindow"] = 5000
 
-for tl in trendlines:
-    trend_type = tl['type']
-    if trend_type == 'resistance' and last_close > tl['y']:  
-        breakout = "Bullish Breakout! 📈"
-    elif trend_type == 'support' and last_close < tl['y']:  
-        breakout = "Bearish Breakout! 📉"
+    query_string = urlencode(sorted(params.items()))  # sorted for consistency
+    signature = hmac.new(
+        API_SECRET.encode('utf-8'),
+        query_string.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
 
-# ✅ 6️⃣ Plot Trendlines & Breakouts
-plt.figure(figsize=(12, 6))
-plt.plot(df['timestamp'], df['close'], label='Close Price', color='black', linewidth=1)
-plt.scatter(df['timestamp'], df['pivot_high'], color='red', label='Pivot Highs', marker='^')
-plt.scatter(df['timestamp'], df['pivot_low'], color='green', label='Pivot Lows', marker='v')
+    url = f"{BASE_URL}{endpoint}?{query_string}&signature={signature}"
 
-for tl in trendlines:
-    plt.axhline(y=tl['y'], color='blue' if tl['type'] == 'resistance' else 'orange', linestyle='--', label=f'{tl["type"].capitalize()} Line')
+    for attempt in range(1, max_retries + 1):
+        try:
+            if method.upper() == "GET":
+                resp = requests.get(url, headers=HEADERS, timeout=12)
+            elif method.upper() == "POST":
+                resp = requests.post(url, headers=HEADERS, timeout=12)
+            elif method.upper() == "DELETE":
+                resp = requests.delete(url, headers=HEADERS, timeout=12)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
 
-plt.title(f'Trendline Breakout Detection - {symbol}')
-plt.xlabel('Date')
-plt.ylabel('Price')
-plt.legend()
-plt.xticks(rotation=45)
-plt.grid()
+            resp.raise_for_status()
+            data = resp.json()
 
-# ✅ 7️⃣ Save Chart
-plot_path = "/home/ubuntu/trendline_breakout.png"
-plt.savefig(plot_path)
-plt.close()
+            # Log rate limit headers if present
+            for header in resp.headers:
+                if header.startswith("X-MBX-USED-WEIGHT-") or header.startswith("X-MBX-ORDER-COUNT-"):
+                    print(f"   {header}: {resp.headers[header]}")
 
-# ✅ 8️⃣ Send Image & Breakout Alerts to Telegram
-TOKEN = "7619077339:AAGvLzsABJRFKsv50TgI1XxMNhVvtED-E_4"
-CHAT_ID = "1385370555"
+            # Even on 200, Binance can return error object
+            if isinstance(data, dict) and "code" in data and data["code"] < 0:
+                print(f"API error → code={data['code']}  msg={data.get('msg','')}")
+                if data["code"] in (-1008, -1003, -1001):  # overload / server busy
+                    time.sleep(attempt * 1.5)
+                    continue
 
-message = "🔔 Trendline Analysis\n"
-if breakout:
-    message += breakout
+            return data
 
-url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-files = {"photo": open(plot_path, "rb")}
-data = {"chat_id": CHAT_ID, "caption": message}
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed (attempt {attempt}/{max_retries}): {str(e)}")
+            if 'resp' in locals() and resp is not None:
+                try:
+                    err = resp.json()
+                    print(f"   → {resp.status_code} | {err.get('code')} | {err.get('msg')}")
+                    if resp.status_code in (429, 418):
+                        print("Rate limit or IP ban detected → stopping")
+                        exit(1)
+                    if resp.status_code == 503 and "Unknown error" in str(err):
+                        print("UNKNOWN execution status – check account/orders manually!")
+                except:
+                    pass
 
-requests.post(url, files=files, data=data)
+            time.sleep(attempt * 2)  # backoff
+
+    print("Giving up after max retries.")
+    return {"error": "Max retries exceeded"}
+
+# ────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────
+
+def load_symbol_precision():
+    global symbol_precision
+    try:
+        data = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=8).json()
+        for sym in data.get("symbols", []):
+            if sym["symbol"] == SYMBOL:
+                for f in sym.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        symbol_precision["quantity"] = abs(int(round(math.log10(1/step))))
+                    if f["filterType"] == "PRICE_FILTER":
+                        tick = float(f["tickSize"])
+                        symbol_precision["price"] = abs(int(round(math.log10(1/tick))))
+                print(f"Precision for {SYMBOL}: qty={symbol_precision['quantity']} dec, price={symbol_precision['price']} dec")
+                return
+        print(f"Warning: precision for {SYMBOL} not found – using defaults")
+    except Exception as e:
+        print(f"Could not load exchangeInfo: {e}")
+
+def format_qty(qty: float) -> str:
+    return f"{qty:.{symbol_precision['quantity']}f}"
+
+def get_usdt_balance() -> float:
+    data = signed_request("GET", "/fapi/v2/account")
+    if "assets" in data:
+        for asset in data["assets"]:
+            if asset["asset"] == "USDT":
+                return float(asset.get("availableBalance", 0))
+    return 0.0
+
+def get_positions():
+    return signed_request("GET", "/fapi/v2/positionRisk")
+
+def setup_symbol():
+    print("\nSetting leverage...")
+    print(signed_request("POST", "/fapi/v1/leverage", {
+        "symbol": SYMBOL,
+        "leverage": LEVERAGE
+    }))
+
+    print("\nSetting margin type...")
+    print(signed_request("POST", "/fapi/v1/marginType", {
+        "symbol": SYMBOL,
+        "marginType": MARGIN_TYPE
+    }))
+
+def market_buy(qty: Optional[float] = None):
+    qty = qty or DEFAULT_QUANTITY
+    qty_str = format_qty(qty)
+    print(f"\n→ MARKET BUY (LONG) {qty_str} {SYMBOL}")
+    return signed_request("POST", "/fapi/v1/order", {
+        "symbol": SYMBOL,
+        "side": "BUY",
+        "type": "MARKET",
+        "quantity": qty_str
+    })
+
+def market_sell(qty: Optional[float] = None):
+    qty = qty or DEFAULT_QUANTITY
+    qty_str = format_qty(qty)
+    print(f"\n→ MARKET SELL (SHORT) {qty_str} {SYMBOL}")
+    return signed_request("POST", "/fapi/v1/order", {
+        "symbol": SYMBOL,
+        "side": "SELL",
+        "type": "MARKET",
+        "quantity": qty_str
+    })
+
+# ────────────────────────────────────────────────
+# Simple CLI
+# ────────────────────────────────────────────────
+
+def print_help():
+    print("""
+Real Binance Futures Commands:
+
+  python bot.py balance           → show available USDT
+  python bot.py positions         → show current positions
+  python bot.py setup             → set leverage + margin type
+  python bot.py buy  [qty]        → MARKET LONG / BUY
+  python bot.py sell [qty]        → MARKET SHORT / SELL
+  python bot.py time              → show server time
+  python bot.py precision         → show quantity & price precision
+
+No arguments → this help
+""")
+
+if __name__ == "__main__":
+    import sys
+    import math   # used for precision calculation
+
+    # Load precision once
+    load_symbol_precision()
+
+    args = sys.argv[1:]
+    if not args:
+        print_help()
+        sys.exit(0)
+
+    cmd = args[0].lower()
+
+    if cmd == "balance":
+        bal = get_usdt_balance()
+        print(f"Available USDT balance: {bal:.2f}")
+
+    elif cmd == "positions":
+        positions = get_positions()
+        active = [p for p in positions if abs(float(p.get("positionAmt", "0"))) > 1e-8]
+        if not active:
+            print("No open positions.")
+        else:
+            for p in active:
+                amt = float(p["positionAmt"])
+                side = "LONG" if amt > 0 else "SHORT"
+                print(f"{p['symbol']} | {side} | amt: {amt:.6f} | "
+                      f"entry: {float(p['entryPrice']):.2f} | "
+                      f"unrealized PnL: {float(p['unRealizedProfit']):+.2f}")
+
+    elif cmd == "setup":
+        setup_symbol()
+
+    elif cmd == "buy":
+        qty = float(args[1]) if len(args) > 1 else None
+        print(market_buy(qty))
+
+    elif cmd == "sell":
+        qty = float(args[1]) if len(args) > 1 else None
+        print(market_sell(qty))
+
+    elif cmd == "time":
+        data = requests.get(f"{BASE_URL}/fapi/v1/time").json()
+        ts = data.get("serverTime", 0)
+        print(f"Binance server time: {ts} ms")
+        print(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts / 1000)))
+
+    elif cmd == "precision":
+        print(f"Symbol: {SYMBOL}")
+        print(f"  Quantity precision: {symbol_precision['quantity']} decimal places")
+        print(f"  Price precision:    {symbol_precision['price']} decimal places")
+
+    else:
+        print(f"Unknown command: {cmd}")
+        print_help()

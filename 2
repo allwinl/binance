@@ -18,12 +18,12 @@ except ImportError:
 import config  # needs API_KEY, API_SECRET
 
 # ─── Config ─────────────────────────────────────────────────────────────────
-TEST_MODE           = True
+TEST_MODE           = True          # set to False to stop the loop
 SYMBOL              = "XRPUSDT"
 TEST_QUANTITY       = 5.0
 LEVERAGE            = 5
 SLEEP_SECONDS       = 20
-ORDER_CONFIRM_DELAY = 6.0
+ORDER_CONFIRM_DELAY = 10.0          # increased from 6s → more reliable fill detection
 
 logging.basicConfig(
     filename='balance_margin_debug.log',
@@ -33,8 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-print(">>> LIVE MODE – REAL MONEY – EXTREME CAUTION <<<")
-print(">>> LONG → close → SHORT → close + BALANCE/MARGIN DEBUG <<<")
+print(">>> LIVE TRADING CODE – REAL MONEY – EXTREME CAUTION <<<")
+print(">>> Sequence: LONG → close → SHORT → close + balance/margin debug <<<")
 logger.critical("BOT STARTED – BALANCE & MARGIN DEBUG – REAL MONEY")
 
 configuration = ConfigurationRestAPI(
@@ -44,13 +44,23 @@ configuration = ConfigurationRestAPI(
 )
 client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
-# ─── New: Get futures account balance & margin info ─────────────────────────
+# ─── Account Status ─────────────────────────────────────────────────────────
 
 def print_account_status():
     try:
-        account = client.rest_api.account_information_v3()
+        response = client.rest_api.account_information_v3()
+        
+        # Most common pattern in recent Binance SDKs
+        if hasattr(response, 'data') and callable(getattr(response, 'data')):
+            account = response.data()
+        else:
+            account = response  # fallback - might already be dict
+        
+        print("\nDEBUG: account response type →", type(account))
+        
         usdt_info = None
-        for asset in account.get('assets', []):
+        assets = account.get('assets', []) if isinstance(account, dict) else []
+        for asset in assets:
             if asset.get('asset') == 'USDT':
                 usdt_info = asset
                 break
@@ -64,17 +74,17 @@ def print_account_status():
         else:
             print("No USDT asset found in account response")
 
-        # Margin ratio / risk
-        print(f"Margin Ratio (approx): {account.get('marginRatio', 'N/A')}")
+        # Margin / risk fields
+        print(f"Margin Ratio:          {account.get('marginRatio', 'N/A')}")
         print(f"Total Maint. Margin:   {account.get('totalMaintMargin', 'N/A')}")
-        print(f"Total Wallet Balance: {account.get('totalWalletBalance', 'N/A')}")
+        print(f"Total Wallet Balance:  {account.get('totalWalletBalance', 'N/A')}")
 
     except Exception as e:
-        print(f"Account info failed: {e}")
-        logger.error(f"Account info failed: {e}")
+        print(f"Account info failed: {str(e)}")
+        logger.error(f"Account info failed: {str(e)}", exc_info=True)
 
 
-# ─── Position query (fixed .data() call) ────────────────────────────────────
+# ─── Position query ─────────────────────────────────────────────────────────
 
 def get_position(symbol):
     qty = 0.0
@@ -86,9 +96,7 @@ def get_position(symbol):
             method = getattr(client.rest_api, endpoint_name)
             resp = method(symbol=symbol)
 
-            # Call .data() to get real content
             data = resp.data() if hasattr(resp, 'data') and callable(getattr(resp, 'data')) else resp
-
             raw_data = data
             used_endpoint = endpoint_name
             logger.debug(f"{endpoint_name} raw data: {data}")
@@ -120,7 +128,7 @@ def set_leverage(symbol, lev):
         logger.info(f"Leverage set → {lev}x")
         print(f"Leverage set → {lev}x")
     except Exception as e:
-        logger.warning(f"Leverage set failed: {e}")
+        logger.warning(f"Leverage set failed (maybe already set?): {e}")
 
 
 def market_order(symbol, side_enum, quantity: float):
@@ -128,9 +136,9 @@ def market_order(symbol, side_enum, quantity: float):
         print("Quantity too small – skipping")
         return None
 
-    qty = round(abs(quantity), 0)
+    qty = round(abs(quantity), 0)  # XRPUSDT stepSize = 1
 
-    # Safety check before order
+    # Safety: show account before sending
     print_account_status()
 
     params = {
@@ -144,14 +152,10 @@ def market_order(symbol, side_enum, quantity: float):
         response = client.rest_api.new_order(**params)
 
         data = response.data() if hasattr(response, 'data') and callable(getattr(response, 'data')) else response
-        logger.info(f"new_order response data: {data}")
+        logger.info(f"new_order response: {data}")
 
         msg = f"ORDER SUCCESS → {side_enum.name} {qty} {symbol}"
-        order_id = None
-        if isinstance(data, dict) and 'orderId' in data:
-            order_id = data['orderId']
-        elif hasattr(data, 'orderId'):
-            order_id = data.orderId
+        order_id = data.get('orderId') if isinstance(data, dict) else getattr(data, 'orderId', None)
         if order_id:
             msg += f"  ID: {order_id}"
         print(msg)
@@ -159,7 +163,6 @@ def market_order(symbol, side_enum, quantity: float):
         print(f"Order sent → waiting {ORDER_CONFIRM_DELAY}s for position update...")
         time.sleep(ORDER_CONFIRM_DELAY)
 
-        # Print account again after order
         print("\nAfter order:")
         print_account_status()
 
@@ -248,7 +251,7 @@ def run_test_cycle():
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"Starting LONG → close → SHORT → close TEST → {SYMBOL} LEVERAGE {LEVERAGE}")
+    print(f"Starting cycle: LONG → close → SHORT → close  |  {SYMBOL} @ {LEVERAGE}x")
     logger.critical(f"TEST STARTED – {SYMBOL} – REAL MONEY – BALANCE/MARGIN DEBUG")
 
     set_leverage(SYMBOL, LEVERAGE)

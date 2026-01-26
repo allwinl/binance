@@ -1,5 +1,5 @@
 # bot.py
-# Binance USDS-M Futures Telegram bot – single file
+# Binance USDS-M Futures Telegram bot – auto check every 30 seconds
 
 import asyncio
 import logging
@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 from typing import Optional, Dict, Set
 import pandas as pd
 import math
+from ta.trend import EMAIndicator   # pip install ta
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -45,6 +46,8 @@ LEVERAGE         = trading_cfg.get("leverage", 5)
 MARGIN_TYPE      = trading_cfg.get("margin_type", "ISOLATED").upper()
 DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 0.001)
 
+CHECK_INTERVAL_SECONDS = 30
+
 if not API_KEY or not API_SECRET or not TELEGRAM_TOKEN:
     print("ERROR: Missing api_key, api_secret or telegram token")
     exit(1)
@@ -63,9 +66,7 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────
 
 monitored_symbols: Set[str] = set()
-
-# "LONG", "SHORT" or None
-symbol_position_state: Dict[str, Optional[str]] = {}
+symbol_position_state: Dict[str, Optional[str]] = {}  # "LONG", "SHORT" or None
 
 # ────────────────────────────────────────────────
 # Binance helpers
@@ -142,27 +143,15 @@ def get_current_price(symbol: str) -> float:
         return float(data["markPrice"])
     return 0.0
 
-def calculate_test_quantity(symbol: str) -> float:
-    filters = get_symbol_filters(symbol)
-    if not filters:
-        return 0.0
-
-    min_notional = filters.get("minNotional", 5.0)
-    step_size = filters.get("stepSize", 0.1)
-    price = get_current_price(symbol)
-
-    if price <= 0:
-        return 0.0
-
-    target_notional = min_notional * 1.05
-    raw_qty = target_notional / price
-
-    steps = math.ceil(raw_qty / step_size)
-    final_qty = steps * step_size
-
-    final_qty = max(final_qty, filters.get("minQty", 0.1))
-
-    return round(final_qty, 6)
+def get_klines(symbol: str, interval: str, limit: int = 100) -> list:
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Klines failed for {symbol} {interval}: {e}")
+        return []
 
 def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False) -> Dict:
     if qty <= 0:
@@ -198,7 +187,6 @@ def close_all_positions():
         qty = abs(amt)
         resp = place_market_order(sym, side, qty, reduce_only=True)
 
-        # Clear state after close
         if resp.get("status") in ("FILLED", "NEW"):
             symbol_position_state[sym] = None
 
@@ -207,18 +195,78 @@ def close_all_positions():
     return closed
 
 # ────────────────────────────────────────────────
+# Auto-check loop (every 30 seconds)
+# ────────────────────────────────────────────────
+
+async def auto_check_symbols(app: Application) -> None:
+    while True:
+        if monitored_symbols:
+            logger.info(f"Auto-checking {len(monitored_symbols)} symbols...")
+            for symbol in list(monitored_symbols):
+                try:
+                    current_side = symbol_position_state.get(symbol, None)
+                    if current_side is not None:
+                        logger.info(f"Skipping {symbol} - already {current_side}")
+                        continue
+
+                    klines_1m = get_klines(symbol, "1m", 50)
+                    if not klines_1m or len(klines_1m) < 3:
+                        logger.warning(f"Not enough 1m data for {symbol}")
+                        continue
+
+                    klines_1d = get_klines(symbol, "1d", 2)
+                    if not klines_1d:
+                        logger.warning(f"Failed to get 1d data for {symbol}")
+                        continue
+
+                    today_open = float(klines_1d[-1][1])
+                    closes = [float(k[4]) for k in klines_1m]
+
+                    df = pd.DataFrame({"close": closes})
+                    ema_indicator = EMAIndicator(close=df["close"], window=3)
+                    ema_series = ema_indicator.ema_indicator()
+                    ema_value = ema_series.iloc[-1]
+
+                    logger.info(
+                        f"[{symbol}] 1d open: {today_open:.4f} | EMA-3: {ema_value:.4f}"
+                    )
+
+                    if ema_value > today_open:
+                        logger.info(f"→ {symbol} EMA-3 > 1d open → opening LONG")
+                        resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY)
+                        logger.info(f"Order result: {resp}")
+                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            symbol_position_state[symbol] = "LONG"
+
+                    elif ema_value < today_open:
+                        logger.info(f"→ {symbol} EMA-3 < 1d open → opening SHORT")
+                        resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY)
+                        logger.info(f"Order result: {resp}")
+                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            symbol_position_state[symbol] = "SHORT"
+
+                    else:
+                        logger.info(f"→ {symbol} EMA-3 == 1d open → no action")
+
+                except Exception as e:
+                    logger.error(f"Error checking {symbol}: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+# ────────────────────────────────────────────────
 # Telegram handlers
 # ────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Futures EMA9 bot\n\n"
+        "Futures EMA-3 bot\n\n"
+        "Auto-check every 30 seconds on monitored symbols.\n\n"
         "Commands:\n"
         "/add SYMBOL     add symbol to monitor\n"
         "/rem SYMBOL     remove one symbol\n"
         "/rem or /reset  clear all + close all positions\n"
-        "/test SYMBOL    small test cycle LONG→close→SHORT→close\n\n"
-        "Send symbol name → check & trade if in list"
+        "/test SYMBOL    manual test cycle LONG→close→SHORT→close\n\n"
+        "Send symbol name → manual check & trade if in list"
     )
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,7 +286,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             monitored_symbols.add(sym)
             symbol_position_state.setdefault(sym, None)
             await update.message.reply_text(
-                f"Added {sym}\n"
+                f"Added {sym} to auto-monitoring\n"
                 f"Current list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
             )
     else:
@@ -271,7 +319,7 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         monitored_symbols.remove(sym)
         symbol_position_state.pop(sym, None)
         await update.message.reply_text(
-            f"Removed {sym}\n"
+            f"Removed {sym} from monitoring\n"
             f"Current list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
         )
     else:
@@ -302,7 +350,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Starting LONG → close → SHORT → close ...\n"
     )
 
-    # LONG open
     await update.message.reply_text("1/4 Opening LONG...")
     open_long = place_market_order(sym, "BUY", qty)
     status = open_long.get('status', 'unknown')
@@ -312,7 +359,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await asyncio.sleep(4)
 
-    # LONG close
     await update.message.reply_text("2/4 Closing LONG...")
     close_long = place_market_order(sym, "SELL", qty, reduce_only=True)
     status_close = close_long.get('status', 'unknown')
@@ -322,7 +368,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await asyncio.sleep(3)
 
-    # SHORT open
     await update.message.reply_text("3/4 Opening SHORT...")
     open_short = place_market_order(sym, "SELL", qty)
     status_s = open_short.get('status', 'unknown')
@@ -332,7 +377,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await asyncio.sleep(4)
 
-    # SHORT close
     await update.message.reply_text("4/4 Closing SHORT...")
     close_short = place_market_order(sym, "BUY", qty, reduce_only=True)
     status_cs = close_short.get('status', 'unknown')
@@ -369,46 +413,53 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    await update.message.reply_text(f"Checking {symbol}...")
+    await update.message.reply_text(f"Manual check: {symbol}...")
 
     klines_1m = get_klines(symbol, "1m", 50)
-    if not klines_1m or len(klines_1m) < 9:
-        await update.message.reply_text("Not enough 1m data")
+    if not klines_1m or len(klines_1m) < 3:
+        await update.message.reply_text("Not enough 1m data for EMA-3")
         return
 
-    klines_1d = get_klines(symbol, "5m", 2)
+    klines_1d = get_klines(symbol, "1d", 2)
     if not klines_1d:
         await update.message.reply_text("Failed to get 1d data")
         return
 
     today_open = float(klines_1d[-1][1])
     closes = [float(k[4]) for k in klines_1m]
+
     df = pd.DataFrame({"close": closes})
-    ema9 = df["close"].ewm(span=2, adjust=False).mean().iloc[-2]
+    ema_indicator = EMAIndicator(close=df["close"], window=3)
+    ema_series = ema_indicator.ema_indicator()
+    ema_value = ema_series.iloc[-1]
 
     msg = (
-        f"{symbol}\n"
-        f"1d open price: {today_open:.4f}\n"
-        f"EMA-9 (1m) value: {ema9:.4f}\n"
+        f"**Manual check {symbol}**\n"
+        f"• 1d candle open price: **{today_open:.4f}**\n"
+        f"• EMA-3 (1m) value: **{ema_value:.4f}**\n"
     )
 
-    if ema9 > today_open:
-        msg += "→ EMA9 > 1d open → opening LONG"
+    if ema_value > today_open:
+        msg += "→ EMA-3 > 1d open → **opening LONG**"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY)
         await update.message.reply_text(f"Order result:\n{resp}")
         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
             symbol_position_state[symbol] = "LONG"
-    elif ema9 < today_open:
-        msg += "→ EMA9 < 1d open → opening SHORT"
+    elif ema_value < today_open:
+        msg += "→ EMA-3 < 1d open → **opening SHORT**"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY)
         await update.message.reply_text(f"Order result:\n{resp}")
         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
             symbol_position_state[symbol] = "SHORT"
     else:
-        msg += "→ EMA9 == 1d open → no action"
+        msg += "→ EMA-3 == 1d open → no action"
         await update.message.reply_text(msg)
+
+async def on_startup(app: Application) -> None:
+    asyncio.create_task(auto_check_symbols(app))
+    logger.info("Auto-check loop started (every 30 seconds)")
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -420,7 +471,11 @@ def main() -> None:
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_symbol_message))
 
-    print("Bot started. Monitored:", monitored_symbols)
+    # Start background auto-check on startup
+    app.post_init = on_startup
+
+    print("Bot starting...")
+    print("Monitored symbols:", monitored_symbols)
     print("Position states:", symbol_position_state)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

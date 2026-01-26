@@ -11,3 +11,7 @@ trading:
   leverage:           5                   # start low (1–20 recommended for testing)
   margin_type:        "ISOLATED"          # or "CROSSED"
   default_quantity:   5             # very small – adjust according to symbol precision
+
+
+telegram:
+  token: 7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0

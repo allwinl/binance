@@ -1,6 +1,7 @@
 # bot.py
 # Binance USDS-M Futures Telegram bot – single file
-# Commands: /add SYMBOL, /rem SYMBOL, /rem or /reset, plain symbol message → check & trade
+# Commands: /add SYMBOL, /rem SYMBOL, /rem or /reset, plain symbol → check & trade
+# New: /test SYMBOL → small test cycle LONG → close → SHORT → close
 
 import asyncio
 import logging
@@ -13,6 +14,7 @@ import yaml
 from urllib.parse import urlencode
 from typing import Optional, Dict, Set
 import pandas as pd
+import math
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -43,7 +45,7 @@ TELEGRAM_TOKEN = telegram_cfg.get("token")
 
 LEVERAGE         = trading_cfg.get("leverage", 5)
 MARGIN_TYPE      = trading_cfg.get("margin_type", "ISOLATED").upper()
-DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 0.001)  # keep small!
+DEFAULT_QUANTITY = trading_cfg.get("default_quantity", 0.001)  # fallback only
 
 if not API_KEY or not API_SECRET or not TELEGRAM_TOKEN:
     print("ERROR: Missing api_key, api_secret or telegram token")
@@ -58,7 +60,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global set of monitored symbols (in-memory, lost on restart)
+# Global set of monitored symbols
 monitored_symbols: Set[str] = set()
 
 # ────────────────────────────────────────────────
@@ -104,34 +106,75 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         logger.error(f"Public GET failed: {e}")
         return []
 
-def symbol_is_valid_perp(symbol: str) -> bool:
+def get_symbol_filters(symbol: str) -> dict:
     data = public_get("/fapi/v1/exchangeInfo")
     if not isinstance(data, dict):
-        return False
+        return {}
     for s in data.get("symbols", []):
-        if s["symbol"] == symbol and s["contractType"] == "PERPETUAL" and s["status"] == "TRADING":
-            return True
-    return False
+        if s["symbol"] == symbol:
+            filters = {}
+            for f in s.get("filters", []):
+                if f["filterType"] == "LOT_SIZE":
+                    filters["minQty"] = float(f["minQty"])
+                    filters["stepSize"] = float(f["stepSize"])
+                if f["filterType"] == "MIN_NOTIONAL":
+                    filters["minNotional"] = float(f.get("notional", 5.0))
+            return filters
+    return {}
 
-def get_klines(symbol: str, interval: str, limit: int = 100) -> list:
-    return public_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+def get_current_price(symbol: str) -> float:
+    data = public_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    if isinstance(data, dict) and "markPrice" in data:
+        return float(data["markPrice"])
+    return 0.0
 
-def place_market_order(symbol: str, side: str, qty: float):
-    qstr = f"{qty:.3f}"   # you may want to adjust precision per symbol
+def calculate_test_quantity(symbol: str) -> float:
+    filters = get_symbol_filters(symbol)
+    if not filters:
+        return 0.0
+
+    min_notional = filters.get("minNotional", 5.0)
+    step_size = filters.get("stepSize", 0.1)
+    price = get_current_price(symbol)
+
+    if price <= 0:
+        return 0.0
+
+    # target notional = min_notional * 1.05
+    target_notional = min_notional * 1.05
+    raw_qty = target_notional / price
+
+    # round up to next valid step
+    steps = math.ceil(raw_qty / step_size)
+    final_qty = steps * step_size
+
+    # at least minQty
+    final_qty = max(final_qty, filters.get("minQty", 0.1))
+
+    return round(final_qty, 6)  # safety
+
+def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False):
+    if qty <= 0:
+        return {"error": "Invalid quantity"}
+
+    qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
+
     params = {
         "symbol": symbol,
         "side": side.upper(),
         "type": "MARKET",
         "quantity": qstr,
     }
-    logger.info(f"Opening {side.upper()} {qstr} {symbol}")
+    if reduce_only:
+        params["reduceOnly"] = "true"
+
+    logger.info(f"Order: {side.upper()} {qstr} {symbol} reduceOnly={reduce_only}")
     return signed_request("POST", "/fapi/v1/order", params)
 
 def close_all_positions():
-    # Get all positions
     positions = signed_request("GET", "/fapi/v2/positionRisk")
     if not isinstance(positions, list):
-        return {"error": "Failed to get positions"}
+        return []
 
     closed = []
     for pos in positions:
@@ -141,18 +184,8 @@ def close_all_positions():
 
         sym = pos["symbol"]
         side = "SELL" if amt > 0 else "BUY"
-        qty_abs = abs(amt)
-        qstr = f"{qty_abs:.3f}"
-
-        params = {
-            "symbol": sym,
-            "side": side,
-            "type": "MARKET",
-            "quantity": qstr,
-            "reduceOnly": "true"
-        }
-        logger.info(f"Closing {sym} {side} {qstr}")
-        resp = signed_request("POST", "/fapi/v1/order", params)
+        qty = abs(amt)
+        resp = place_market_order(sym, side, qty, reduce_only=True)
         closed.append((sym, resp))
 
     return closed
@@ -165,10 +198,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Futures EMA9 bot\n\n"
         "Commands:\n"
-        "/add SYMBOL     → add symbol to monitor (e.g. /add XRPUSDT)\n"
-        "/rem SYMBOL     → remove one symbol\n"
-        "/rem or /reset  → clear all symbols + close all positions\n\n"
-        "Just send a symbol (XRPUSDT) → check & trade if it's in your list"
+        "/add SYMBOL     add symbol to monitor\n"
+        "/rem SYMBOL     remove one symbol\n"
+        "/rem or /reset  clear all + close all positions\n"
+        "/test SYMBOL    small test cycle LONG→close→SHORT→close\n\n"
+        "Send symbol name → check & trade if in list"
     )
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -178,41 +212,43 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     sym = context.args[0].strip().upper()
     if not sym.endswith("USDT"):
-        await update.message.reply_text("Only USDT perpetual symbols are supported")
+        await update.message.reply_text("Only USDT perpetual symbols")
         return
 
     if symbol_is_valid_perp(sym):
         if sym in monitored_symbols:
-            await update.message.reply_text(f"{sym} is already monitored")
+            await update.message.reply_text(f"{sym} already monitored")
         else:
             monitored_symbols.add(sym)
-            await update.message.reply_text(f"Added {sym} to monitoring list\nCurrent list: {', '.join(sorted(monitored_symbols)) or 'empty'}")
+            await update.message.reply_text(
+                f"Added {sym}\n"
+                f"Current list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
+            )
     else:
-        await update.message.reply_text(f"{sym} is not a valid/trading USDS-M perpetual symbol")
+        await update.message.reply_text(f"{sym} not valid or not trading")
 
 async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        # /rem or /reset without args → clear all + close positions
+        # clear all + close positions
         old_list = sorted(monitored_symbols)
         monitored_symbols.clear()
 
         closed = close_all_positions()
 
-        text = "Cleared all monitored symbols.\n"
+        text = "Reset complete.\n"
         if old_list:
-            text += f"Removed: {', '.join(old_list)}\n"
+            text += f"Removed symbols: {', '.join(old_list)}\n"
         else:
-            text += "List was already empty.\n"
+            text += "No symbols were monitored.\n"
 
         if closed:
-            text += "Closed positions:\n" + "\n".join([f"{s}: {r}" for s, r in closed])
+            text += "Closed positions:\n" + "\n".join([f"• {s}: {r.get('msg', 'ok')}" for s, r in closed])
         else:
-            text += "No positions were open."
+            text += "No open positions found."
 
         await update.message.reply_text(text)
         return
 
-    # /rem SYMBOL → remove one
     sym = context.args[0].strip().upper()
     if sym in monitored_symbols:
         monitored_symbols.remove(sym)
@@ -221,32 +257,86 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Current list: {', '.join(sorted(monitored_symbols)) or 'empty'}"
         )
     else:
-        await update.message.reply_text(f"{sym} was not in the monitored list")
+        await update.message.reply_text(f"{sym} not in list")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /test XRPUSDT")
+        return
+
+    sym = context.args[0].strip().upper()
+    if not sym.endswith("USDT"):
+        await update.message.reply_text("Only USDT symbols")
+        return
+
+    if not symbol_is_valid_perp(sym):
+        await update.message.reply_text(f"{sym} not valid perpetual futures pair")
+        return
+
+    qty = calculate_test_quantity(sym)
+    if qty <= 0:
+        await update.message.reply_text("Cannot calculate test quantity (price or filters issue)")
+        return
+
+    await update.message.reply_text(
+        f"Test cycle on {sym}\n"
+        f"Calculated quantity: {qty:.6f}  (~5% above min notional)\n"
+        "Starting LONG → close → SHORT → close ...\n"
+    )
+
+    # LONG open
+    await update.message.reply_text("1/4 Opening LONG...")
+    open_long = place_market_order(sym, "BUY", qty)
+    await update.message.reply_text(f"Open LONG: {open_long.get('status', 'unknown')} {open_long.get('orderId', '')}")
+
+    await asyncio.sleep(4)
+
+    # LONG close
+    await update.message.reply_text("2/4 Closing LONG...")
+    close_long = place_market_order(sym, "SELL", qty, reduce_only=True)
+    await update.message.reply_text(f"Close LONG: {close_long.get('status', 'unknown')} {close_long.get('orderId', '')}")
+
+    await asyncio.sleep(3)
+
+    # SHORT open
+    await update.message.reply_text("3/4 Opening SHORT...")
+    open_short = place_market_order(sym, "SELL", qty)
+    await update.message.reply_text(f"Open SHORT: {open_short.get('status', 'unknown')} {open_short.get('orderId', '')}")
+
+    await asyncio.sleep(4)
+
+    # SHORT close
+    await update.message.reply_text("4/4 Closing SHORT...")
+    close_short = place_market_order(sym, "BUY", qty, reduce_only=True)
+    await update.message.reply_text(f"Close SHORT: {close_short.get('status', 'unknown')} {close_short.get('orderId', '')}")
+
+    await update.message.reply_text("Test cycle finished.")
+
+async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip().upper()
-    if text.startswith(('/', 'HELP')) or len(text) < 4 or not text.endswith("USDT"):
-        return  # ignore commands & invalid messages
+    if text.startswith('/') or len(text) < 4 or not text.endswith("USDT"):
+        return
 
     symbol = text
 
     if not monitored_symbols:
-        await update.message.reply_text("Your monitored list is empty. Use /add SYMBOL first.")
+        await update.message.reply_text("Monitored list is empty. Use /add first.")
         return
 
     if symbol not in monitored_symbols:
         await update.message.reply_text(
-            f"{symbol} is not in your monitored list.\n"
-            f"Current list: {', '.join(sorted(monitored_symbols))}\n"
+            f"{symbol} not in your list.\n"
+            f"Current: {', '.join(sorted(monitored_symbols)) or 'empty'}\n"
             "Use /add to include it."
         )
         return
 
-    await update.message.reply_text(f"Analyzing {symbol}...")
+    # ───── normal EMA logic ─────
+    await update.message.reply_text(f"Checking {symbol}...")
 
     klines_1m = get_klines(symbol, "1m", 50)
     if not klines_1m or len(klines_1m) < 9:
-        await update.message.reply_text("Not enough 1m candles")
+        await update.message.reply_text("Not enough 1m data")
         return
 
     klines_1d = get_klines(symbol, "1d", 2)
@@ -254,29 +344,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Failed to get 1d data")
         return
 
-    today_open = float(klines_1d[-1][1])  # open of current day candle
+    today_open = float(klines_1d[-1][1])
     closes = [float(k[4]) for k in klines_1m]
     df = pd.DataFrame({"close": closes})
     ema9 = df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
 
-    msg = (
-        f"{symbol}\n"
-        f"1d open: {today_open:.4f}\n"
-        f"EMA-9 (1m): {ema9:.4f}\n"
-    )
+    msg = f"{symbol}\n1d open: {today_open:.4f}\nEMA-9 (1m): {ema9:.4f}\n"
 
     if ema9 > today_open:
-        msg += "→ EMA9 > 1d open → opening LONG"
+        msg += "→ opening LONG"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "BUY", DEFAULT_QUANTITY)
-        await update.message.reply_text(f"Order result:\n{resp}")
+        await update.message.reply_text(f"Result: {resp}")
     elif ema9 < today_open:
-        msg += "→ EMA9 < 1d open → opening SHORT"
+        msg += "→ opening SHORT"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "SELL", DEFAULT_QUANTITY)
-        await update.message.reply_text(f"Order result:\n{resp}")
+        await update.message.reply_text(f"Result: {resp}")
     else:
-        msg += "→ EMA9 == 1d open → no action"
+        msg += "→ no action (equal)"
         await update.message.reply_text(msg)
 
 def main() -> None:
@@ -285,10 +371,11 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("rem", cmd_rem))
-    app.add_handler(CommandHandler("reset", cmd_rem))  # alias
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("reset", cmd_rem))
+    app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_symbol_message))
 
-    print("Bot started. Monitored symbols:", monitored_symbols)
+    print("Bot started. Monitored:", monitored_symbols)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

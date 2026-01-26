@@ -1,6 +1,8 @@
 # bot.py
 # Binance USDS-M Futures Telegram bot – auto check every 30 seconds
-# Fixed: set leverage/margin only if needed, better error handling
+# Fixed: all functions defined before use, no NameError
+# /rem SYMBOL closes position + removes from monitoring
+# Auto sets Isolated margin + 5x leverage on /add (skips if already set)
 
 import asyncio
 import logging
@@ -70,7 +72,7 @@ monitored_symbols: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}  # "LONG", "SHORT" or None
 
 # ────────────────────────────────────────────────
-# Binance helpers
+# Binance helpers (defined BEFORE any call)
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> Dict:
@@ -81,14 +83,13 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> Dict:
 
     qs = urlencode(sorted(params.items()))
     sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    full_url = f"{BASE_URL}{endpoint}?{qs}&signature={sig}"
-    logger.debug(f"Sending {method} to: {full_url}")
+    url = f"{BASE_URL}{endpoint}?{qs}&signature={sig}"
 
     try:
         if method.upper() == "GET":
-            r = requests.get(full_url, headers=HEADERS, timeout=10)
+            r = requests.get(url, headers=HEADERS, timeout=10)
         elif method.upper() == "POST":
-            r = requests.post(full_url, headers=HEADERS, timeout=10)
+            r = requests.post(url, headers=HEADERS, timeout=10)
         else:
             raise ValueError("Bad method")
 
@@ -96,13 +97,13 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> Dict:
         data = r.json()
 
         if isinstance(data, dict) and "code" in data and data["code"] < 0:
-            logger.error(f"API error {data['code']}: {data.get('msg')} | URL: {full_url}")
+            logger.error(f"API error {data['code']}: {data.get('msg')} | URL: {url}")
         return data
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error {e.response.status_code}: {e.response.text} | URL: {full_url}")
+        logger.error(f"HTTP error {e.response.status_code}: {e.response.text} | URL: {url}")
         return {"error": str(e), "status_code": e.response.status_code}
     except Exception as e:
-        logger.error(f"Request failed: {e} | URL: {full_url}")
+        logger.error(f"Request failed: {e} | URL: {url}")
         return {"error": str(e)}
 
 def public_get(endpoint: str, params: Dict = None) -> list | dict:
@@ -117,44 +118,41 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         return []
 
 def set_leverage_and_margin(symbol: str) -> bool:
-    # First check current settings to avoid redundant calls
+    # Check current settings first
     pos_data = signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not isinstance(pos_data, list) or not pos_data:
         logger.warning(f"Cannot check current settings for {symbol}")
         return False
 
     current_leverage = int(pos_data[0].get("leverage", 0))
-    current_margin_type = pos_data[0].get("isolatedMargin", "false") == "true" and "ISOLATED" or "CROSSED"
+    current_margin = "ISOLATED" if pos_data[0].get("isolated", False) else "CROSSED"
 
-    need_set_leverage = current_leverage != FIXED_LEVERAGE
-    need_set_margin   = current_margin_type != FIXED_MARGIN_TYPE
-
-    if not need_set_leverage and not need_set_margin:
-        logger.info(f"{symbol} already at {FIXED_LEVERAGE}x + {FIXED_MARGIN_TYPE} – skipping set")
+    if current_leverage == FIXED_LEVERAGE and current_margin == FIXED_MARGIN_TYPE:
+        logger.info(f"{symbol} already at {FIXED_LEVERAGE}x + {FIXED_MARGIN_TYPE} – skip set")
         return True
 
     success = True
 
-    if need_set_leverage:
+    if current_leverage != FIXED_LEVERAGE:
         lev_resp = signed_request("POST", "/fapi/v1/leverage", {
             "symbol": symbol,
             "leverage": FIXED_LEVERAGE
         })
         if "code" in lev_resp and lev_resp["code"] < 0:
-            logger.error(f"Failed to set leverage on {symbol}: {lev_resp}")
+            logger.error(f"Failed leverage {symbol}: {lev_resp}")
             success = False
 
-    if need_set_margin:
+    if current_margin != FIXED_MARGIN_TYPE:
         margin_resp = signed_request("POST", "/fapi/v1/marginType", {
             "symbol": symbol,
             "marginType": FIXED_MARGIN_TYPE
         })
         if "code" in margin_resp and margin_resp["code"] < 0:
-            logger.error(f"Failed to set margin type on {symbol}: {margin_resp}")
+            logger.error(f"Failed margin type {symbol}: {margin_resp}")
             success = False
 
     if success:
-        logger.info(f"Successfully set/verified {symbol}: {FIXED_LEVERAGE}x + {FIXED_MARGIN_TYPE}")
+        logger.info(f"Verified/set {symbol}: {FIXED_LEVERAGE}x + {FIXED_MARGIN_TYPE}")
     return success
 
 def get_current_position_data(symbol: str) -> dict:
@@ -195,6 +193,16 @@ def get_current_price(symbol: str) -> float:
         return float(data["markPrice"])
     logger.warning(f"No markPrice for {symbol}")
     return 0.0
+
+def get_klines(symbol: str, interval: str, limit: int = 100) -> list:
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Klines failed for {symbol} {interval}: {e}")
+        return []
 
 def calculate_safe_quantity(symbol: str) -> float:
     data = public_get("/fapi/v1/exchangeInfo")

@@ -1,0 +1,13 @@
+# config.yaml
+# NEVER commit this file to version control or share it
+# This is for REAL Binance mainnet (live trading)
+
+binance:
+  api_key:     "swNCkZLoqzFnYPreUDrFAAnoAxsx16PcJSDlU3AEpep7MwaOCVXzq3YHUDJkZvu8"
+  api_secret:  "f7774SEvatAbZJHNP6NYZu6dtAb6zxYUBmxQp6c8d90PbNvlvKLYl1ofF7A1J4qn"
+
+trading:
+  symbol:             "XRPUSDT"           # change to SOLUSDT, ETHUSDT, etc. if desired
+  leverage:           5                   # start low (1–20 recommended for testing)
+  margin_type:        "ISOLATED"          # or "CROSSED"
+  default_quantity:   5             # very small – adjust according to symbol precision

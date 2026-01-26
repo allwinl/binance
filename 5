@@ -376,7 +376,7 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Not enough 1m data")
         return
 
-    klines_1d = get_klines(symbol, "1d", 2)
+    klines_1d = get_klines(symbol, "5m", 2)
     if not klines_1d:
         await update.message.reply_text("Failed to get 1d data")
         return
@@ -384,7 +384,7 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
     today_open = float(klines_1d[-1][1])
     closes = [float(k[4]) for k in klines_1m]
     df = pd.DataFrame({"close": closes})
-    ema9 = df["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    ema9 = df["close"].ewm(span=2, adjust=False).mean().iloc[-2]
 
     msg = (
         f"{symbol}\n"

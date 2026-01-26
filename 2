@@ -1,5 +1,5 @@
 # bot.py
-# Binance USDS-M Futures – Simple LONG ↔ SHORT flip test with fill verification
+# Binance USDS-M Futures – LONG ↔ SHORT flip test with model fix + fill check
 # XRPUSDT – VERY SMALL SIZE – REAL MONEY – EXTREME CAUTION
 
 import time
@@ -23,7 +23,8 @@ SYMBOL            = "XRPUSDT"
 QUANTITY          = 5.0
 LEVERAGE          = 5
 SLEEP_AFTER_CYCLE = 20
-ORDER_WAIT        = 12.0   # increased slightly
+ORDER_WAIT        = 12.0
+USE_TEST_ORDER    = True  # Set False for real orders
 
 logging.basicConfig(
     filename='flip_test_debug.log',
@@ -35,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 print(">>> LIVE TRADING – REAL MONEY – EXTREME CAUTION <<<")
 print(f">>> Flip: LONG ↔ SHORT | {SYMBOL} @ {LEVERAGE}x | qty {QUANTITY} <<<")
-logger.info("BOT STARTED – LONG/SHORT FLIP WITH FILL CHECK")
+if USE_TEST_ORDER:
+    print(">>> USING TEST MODE (no real execution) – orders simulated only <<<")
+logger.info("BOT STARTED – FIXED FOR MODEL OBJECTS")
 
 configuration = ConfigurationRestAPI(
     api_key=config.API_KEY,
@@ -46,71 +49,78 @@ client = DerivativesTradingUsdsFutures(config_rest_api=configuration)
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
-def get_position(symbol=None):  # symbol=None → get all positions
+def get_position(symbol=None):
     qty = 0.0
-    used_endpoint = "none"
-    all_raw = []
+    used = "none"
+    raw_samples = []
 
     for ep in ['position_information_v3', 'position_information_v2']:
         try:
             method = getattr(client.rest_api, ep)
-            if symbol:
-                resp = method(symbol=symbol)
-            else:
-                resp = method()  # all positions
+            resp = method() if symbol is None else method(symbol=symbol)
             data = resp.data() if hasattr(resp, 'data') and callable(getattr(resp, 'data')) else resp
 
-            all_raw.append((ep, data))
+            raw_samples.append((ep, data))
 
             if isinstance(data, list):
                 if symbol:
                     for pos in data:
-                        if pos.get('symbol') == symbol:
-                            amt_str = pos.get('positionAmt', '0')
+                        if getattr(pos, 'symbol', '') == symbol:
+                            amt_str = getattr(pos, 'positionAmt', '0')
                             qty = float(amt_str)
-                            used_endpoint = ep
-                            print(f"Found {symbol} in {ep}: positionAmt = {amt_str} | side={pos.get('positionSide')}")
+                            used = ep
+                            print(f"{symbol} in {ep}: positionAmt = {amt_str} | side={getattr(pos, 'positionSide', 'N/A')}")
                             break
                 else:
-                    # For all positions: scan for symbol
                     for pos in data:
-                        if pos.get('symbol') == SYMBOL:
-                            amt_str = pos.get('positionAmt', '0')
+                        if getattr(pos, 'symbol', '') == SYMBOL:
+                            amt_str = getattr(pos, 'positionAmt', '0')
                             qty = float(amt_str)
-                            used_endpoint = ep + " (all)"
-                            print(f"Found {SYMBOL} in all positions ({ep}): positionAmt = {amt_str}")
+                            used = ep + " (all)"
+                            print(f"{SYMBOL} in all ({ep}): positionAmt = {amt_str}")
                             break
-                    print(f"All positions count: {len(data)}")
-                    if len(data) > 0:
-                        print("First few raw: ", data[:2])  # debug
+                    print(f"All positions: {len(data)} items")
+                    if data:
+                        print(f"Sample (first): {data[0]}")
 
             if qty != 0.0:
                 break
         except Exception as e:
             print(f"{ep} error: {e}")
-            logger.error(f"{ep} error: {e}")
+            logger.error(f"{ep}: {e}")
 
-    if qty == 0.0 and all_raw:
-        print("Position 0 – raw responses (last tried):")
-        for ep, d in all_raw[-1:]:
-            print(f"  {ep}: type={type(d)}, len={len(d) if isinstance(d, list) else 'N/A'}, sample={d[:1] if isinstance(d, list) else d}")
+    if qty == 0.0 and raw_samples:
+        print("Position 0 – last raw:")
+        ep, d = raw_samples[-1]
+        print(f"  {ep}: type={type(d)}, len={len(d) if isinstance(d, list) else 'N/A'}")
+        if isinstance(d, list) and d:
+            print(f"  Sample item: {d[0]}")
 
-    print(f"Detected position: {qty:+.1f} (endpoint: {used_endpoint})")
+    print(f"Detected: {qty:+.1f} ({used})")
     return qty
 
 
-def set_leverage(symbol, lev):
+def get_futures_balance():
     try:
-        client.rest_api.change_initial_leverage(symbol=symbol, leverage=lev)
-        print(f"Leverage set: {lev}x")
+        resp = client.rest_api.balance_v2()  # /fapi/v2/balance
+        data = resp.data() if hasattr(resp, 'data') and callable(getattr(resp, 'data')) else resp
+        if isinstance(data, list):
+            for asset in data:
+                if getattr(asset, 'asset', '') == 'USDT':
+                    print(f"USDT Futures Balance:")
+                    print(f"  Wallet: {getattr(asset, 'balance', 'N/A')}")
+                    print(f"  Available: {getattr(asset, 'availableBalance', 'N/A')}")
+                    print(f"  Cross Wallet: {getattr(asset, 'crossWalletBalance', 'N/A')}")
+                    return
+        print("No USDT in balance response")
     except Exception as e:
-        print(f"Leverage warning: {e}")
+        print(f"Balance check failed: {e}")
 
 
 def send_market_order(symbol, side_enum, qty_float: float):
     qty = round(abs(qty_float), 0)
     if qty < 1:
-        print("Qty too small – skip")
+        print("Qty too small")
         return False
 
     params = {
@@ -120,42 +130,42 @@ def send_market_order(symbol, side_enum, qty_float: float):
         "quantity": qty,
     }
 
+    endpoint = 'new_order_test' if USE_TEST_ORDER else 'new_order'
     try:
-        response = client.rest_api.new_order(**params)
+        method = getattr(client.rest_api, endpoint)
+        response = method(**params)
         data = response.data() if hasattr(response, 'data') and callable(getattr(response, 'data')) else response
 
-        order_id = data.get('orderId') if isinstance(data, dict) else getattr(data, 'orderId', None)
-        client_order_id = data.get('clientOrderId') if isinstance(data, dict) else getattr(data, 'clientOrderId', None)
-        print(f"ORDER PLACED → {side_enum.name} {qty} {symbol} | ID: {order_id or client_order_id or 'N/A'}")
+        order_id = getattr(data, 'orderId', None) or data.get('orderId') if isinstance(data, dict) else None
+        print(f"{'TEST ' if USE_TEST_ORDER else ''}ORDER → {side_enum.name} {qty} {symbol} | ID: {order_id or 'N/A'}")
 
-        if not order_id:
-            print("No order ID – placement likely failed")
+        if not order_id and not USE_TEST_ORDER:
+            print("No orderId – failed")
             return False
 
-        # Check status
-        time.sleep(2)  # brief wait
-        try:
-            status_method = getattr(client.rest_api, 'order_information', None) or getattr(client.rest_api, 'get_order', None)
-            if status_method:
-                status_resp = status_method(symbol=symbol, orderId=order_id)
-                status_data = status_resp.data() if hasattr(status_resp, 'data') else status_resp
-                status = status_data.get('status') if isinstance(status_data, dict) else getattr(status_data, 'status', 'UNKNOWN')
-                print(f"Order status: {status}")
-                if status != 'FILLED':
-                    print(f"!!! NOT FILLED ({status}) – check Binance app/web for rejection reason (margin? min notional? permissions?)")
-                    return False
-            else:
-                print("No order_information method in SDK – manual check needed")
-        except Exception as e:
-            print(f"Status check failed: {e} (continue anyway)")
+        if USE_TEST_ORDER:
+            print("Test order succeeded (simulated)")
+            time.sleep(ORDER_WAIT)
+            return True
 
-        print(f"Waiting {ORDER_WAIT}s for position update...")
-        time.sleep(ORDER_WAIT)
+        # Real order: status check
+        time.sleep(3)
+        try:
+            status_resp = client.rest_api.order_information(symbol=symbol, orderId=order_id)
+            s_data = status_resp.data() if hasattr(status_resp, 'data') else status_resp
+            status = getattr(s_data, 'status', 'UNKNOWN') or s_data.get('status')
+            print(f"Status: {status}")
+            if status != 'FILLED':
+                print(f"NOT FILLED ({status}) – check Binance")
+                return False
+        except Exception as e:
+            print(f"Status check fail: {e}")
+
+        time.sleep(ORDER_WAIT - 3)
         return True
 
     except Exception as e:
-        print(f"ORDER PLACEMENT FAILED: {e}")
-        logger.error(f"Order fail: {e}")
+        print(f"ORDER FAIL: {e}")
         return False
 
 
@@ -163,42 +173,39 @@ def send_market_order(symbol, side_enum, qty_float: float):
 
 if __name__ == "__main__":
     set_leverage(SYMBOL, LEVERAGE)
+    get_futures_balance()  # Check if funds available
 
-    # Optional: check position mode if SDK supports
     try:
-        mode_resp = client.rest_api.position_mode()  # or dual_side_position
-        mode_data = mode_resp.data() if hasattr(mode_resp, 'data') else mode_resp
-        dual = mode_data.get('dualSidePosition', False)
-        print(f"Position mode: {'Hedge (dual)' if dual else 'One-way'}")
+        mode = client.rest_api.position_mode()
+        dual = mode.data().dualSidePosition if hasattr(mode, 'data') else mode.dualSidePosition
+        print(f"Mode: {'Hedge' if dual else 'One-way'}")
     except:
-        print("Could not check position mode – assume One-way (common). Check in Binance app: Futures > Preferences.")
+        print("Mode check failed – assume One-way. Verify in app.")
 
     cycle = 0
     while RUN_LOOP:
         cycle += 1
-        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        print(f"\n=== Cycle {cycle} @ {now} ===")
+        print(f"\n=== Cycle {cycle} @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
 
-        pos_qty = get_position(SYMBOL)  # or get_position() for all
+        pos = get_position(SYMBOL)
 
         success = False
-        if pos_qty > 0:
-            print(f"LONG open → flip to SHORT (SELL {QUANTITY})")
+        if pos > 0:
+            print(f"LONG → flip SHORT (SELL {QUANTITY})")
             success = send_market_order(SYMBOL, NewOrderSideEnum["SELL"], QUANTITY)
-        elif pos_qty < 0:
-            print(f"SHORT open → flip to LONG (BUY {QUANTITY})")
+        elif pos < 0:
+            print(f"SHORT → flip LONG (BUY {QUANTITY})")
             success = send_market_order(SYMBOL, NewOrderSideEnum["BUY"], QUANTITY)
         else:
-            print(f"Flat → start LONG (BUY {QUANTITY})")
+            print(f"Flat → LONG (BUY {QUANTITY})")
             success = send_market_order(SYMBOL, NewOrderSideEnum["BUY"], QUANTITY)
 
-        # Verify flip happened
         time.sleep(2)
-        new_qty = get_position(SYMBOL)
-        print(f"After order: position {new_qty:+.1f}")
+        new_pos = get_position(SYMBOL)
+        print(f"After: {new_pos:+.1f}")
 
-        if not success or new_qty == pos_qty:
-            print("!!! No change detected – STOPPING to avoid accumulation. Check Binance manually.")
+        if not success or new_pos == pos:
+            print("No change / fail – STOPPING. Check Binance manually (orders, positions, balance transfer).")
             break
 
         time.sleep(SLEEP_AFTER_CYCLE)

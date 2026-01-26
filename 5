@@ -417,12 +417,12 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Not enough 1m data")
         return
 
-    klines_1d = get_klines(symbol, "1d", 2)
-    if not klines_1d:
-        await update.message.reply_text("Failed to get 1d data")
+    klines_5m = get_klines(symbol, "5m", 2)
+    if not klines_5m:
+        await update.message.reply_text("Failed to get 5m data")
         return
 
-    today_open = float(klines_1d[-1][1])
+    today_open = float(klines_5m[-1][1])
     closes = [float(k[4]) for k in klines_1m]
 
     df = pd.DataFrame({"close": closes})
@@ -433,7 +433,7 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     msg = (
         f"**Manual check {symbol}**\n"
-        f"1d open: {today_open:.4f}\n"
+        f"5m open: {today_open:.4f}\n"
         f"EMA-3: {ema_value:.4f}\n"
         f"Quantity: {qty:.6f}\n"
     )
@@ -485,11 +485,11 @@ async def auto_check_symbols(app: Application) -> None:
                     if not klines_1m or len(klines_1m) < 3:
                         continue
 
-                    klines_1d = get_klines(symbol, "1d", 2)
-                    if not klines_1d:
+                    klines_5m = get_klines(symbol, "5m", 2)
+                    if not klines_5m:
                         continue
 
-                    today_open = float(klines_1d[-1][1])
+                    today_open = float(klines_5m[-1][1])
                     closes = [float(k[4]) for k in klines_1m]
 
                     df = pd.DataFrame({"close": closes})
@@ -497,7 +497,7 @@ async def auto_check_symbols(app: Application) -> None:
                     ema_value = ema_indicator.ema_indicator().iloc[-1]
 
                     logger.info(
-                        f"[{symbol}] 1d open: {today_open:.4f} | EMA-3: {ema_value:.4f} | pos: {current_side or 'None'}"
+                        f"[{symbol}] 5m open: {today_open:.4f} | EMA-3: {ema_value:.4f} | pos: {current_side or 'None'}"
                     )
 
                     should_long  = ema_value > today_open

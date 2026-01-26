@@ -1,5 +1,8 @@
 # bot.py
 # Binance USDS-M Futures Telegram bot – auto check every 30 seconds
+# /rem SYMBOL now closes position + removes from monitoring
+# Auto sets Isolated margin + 5x leverage on /add
+# Dynamic quantity (5% above minNotional) everywhere
 
 import asyncio
 import logging
@@ -69,7 +72,7 @@ monitored_symbols: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}  # "LONG", "SHORT" or None
 
 # ────────────────────────────────────────────────
-# Binance helpers (all defined before use)
+# Binance helpers
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> Dict:
@@ -170,16 +173,26 @@ def get_current_price(symbol: str) -> float:
     logger.warning(f"No markPrice for {symbol}")
     return 0.0
 
+def get_klines(symbol: str, interval: str, limit: int = 100) -> list:
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Klines failed for {symbol} {interval}: {e}")
+        return []
+
 def calculate_safe_quantity(symbol: str) -> float:
-    filters = public_get("/fapi/v1/exchangeInfo")
-    if not isinstance(filters, dict):
+    data = public_get("/fapi/v1/exchangeInfo")
+    if not isinstance(data, dict):
         logger.warning(f"No exchangeInfo for {symbol}")
         return 0.001
 
     min_notional = 5.0
     step_size = 0.1
     min_qty = 0.1
-    for s in filters.get("symbols", []):
+    for s in data.get("symbols", []):
         if s["symbol"] == symbol:
             for f in s.get("filters", []):
                 if f["filterType"] == "LOT_SIZE":
@@ -356,7 +369,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        f"Test cycle {sym} | qty: {qty:.6f}\n"
+        f"Test cycle {sym}\n"
+        f"Quantity: {qty:.6f}\n"
         "LONG → close → SHORT → close ...\n"
     )
 

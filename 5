@@ -214,7 +214,7 @@ async def auto_check_symbols(app: Application) -> None:
                         logger.warning(f"Not enough 1m data for {symbol}")
                         continue
 
-                    klines_1d = get_klines(symbol, "1d", 2)
+                    klines_1d = get_klines(symbol, "5m", 2)
                     if not klines_1d:
                         logger.warning(f"Failed to get 1d data for {symbol}")
                         continue

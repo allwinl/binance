@@ -438,7 +438,7 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(f"Manual check: {symbol}")
 
     klines_1m = get_klines(symbol, "1m", 50)
-    if not klines_1m or len(klines_1m) < 3:
+    if not klines_1m or len(klines_1m) < 5:
         await update.message.reply_text("Not enough 1m data")
         return
 
@@ -451,9 +451,10 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
     closes = [float(k[4]) for k in klines_1m]
 
     df = pd.DataFrame({"close": closes})
-    ema_indicator = EMAIndicator(close=df["close"], window=3)
-    ema_value = ema_indicator.ema_indicator().iloc[-1]
-
+    ema_indicator = EMAIndicator(close=df["close"], window=5)
+    ema_value = ema_indicator.ema_indicator().iloc[-2]
+    ema_value2 = ema_indicator.ema_indicator().iloc[-3]
+    
     qty = calculate_safe_quantity(symbol)
 
     msg = (
@@ -463,14 +464,14 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
         f"Quantity: {qty:.6f}\n"
     )
 
-    if ema_value > today_open:
+    if ema_value > today_open and ema_value2 < today_open:
         msg += "→ opening LONG"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "BUY", qty)
         await update.message.reply_text(f"Result:\n{resp}")
         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
             symbol_position_state[symbol] = "LONG"
-    elif ema_value < today_open:
+    elif ema_value < today_open and ema_value2 > today_open:
         msg += "→ opening SHORT"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "SELL", qty)

@@ -3,6 +3,11 @@
 # Fixed: all functions defined before use, no NameError
 # /rem SYMBOL closes position + removes from monitoring
 # Auto sets Isolated margin + 5x leverage on /add (skips if already set)
+# ────────────────────────────────────────────────
+# SIGNAL LOGIC (updated 2025):
+# LONG  : EMA[-2] > open_price  AND  EMA[-3] <= open_price   → crossover UP
+# SHORT : EMA[-2] < open_price  AND  EMA[-3] >= open_price   → crossover DOWN
+# ────────────────────────────────────────────────
 
 import asyncio
 import logging
@@ -118,7 +123,6 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         return []
 
 def set_leverage_and_margin(symbol: str) -> bool:
-    # Check current settings first
     pos_data = signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not isinstance(pos_data, list) or not pos_data:
         logger.warning(f"Cannot check current settings for {symbol}")
@@ -295,11 +299,12 @@ def close_all_positions():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Futures EMA-3 bot\n\n"
+        "Futures EMA-3 Crossover bot\n\n"
         "• Auto-check every 30s\n"
-        "• Auto-reverse on opposite signal\n"
+        "• Opens on EMA crossover vs day open\n"
+        "• Auto-reverse on opposite crossover\n"
         "• Loss-cut if PnL < threshold\n"
-        "• /rem SYMBOL closes position + removes\n"
+        "• /rem SYMBOL closes + removes\n"
         "• Auto Isolated + 5x on /add\n\n"
         "Commands:\n"
         "/add SYMBOL\n"
@@ -439,7 +444,7 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     klines_1m = get_klines(symbol, "1m", 50)
     if not klines_1m or len(klines_1m) < 5:
-        await update.message.reply_text("Not enough 1m data")
+        await update.message.reply_text("Not enough 1m data (need ≥ 5 candles)")
         return
 
     klines_1d = get_klines(symbol, "1d", 2)
@@ -451,35 +456,42 @@ async def handle_symbol_message(update: Update, context: ContextTypes.DEFAULT_TY
     closes = [float(k[4]) for k in klines_1m]
 
     df = pd.DataFrame({"close": closes})
-    ema_indicator = EMAIndicator(close=df["close"], window=5)
-    ema_value = ema_indicator.ema_indicator().iloc[-2]
-    ema_value2 = ema_indicator.ema_indicator().iloc[-3]
-    
+    ema_indicator = EMAIndicator(close=df["close"], window=3)
+    ema_series = ema_indicator.ema_indicator()
+
+    if len(ema_series) < 3:
+        await update.message.reply_text("Not enough EMA values yet")
+        return
+
+    ema_prev2 = ema_series.iloc[-2]   # t-2 (most recent completed bar)
+    ema_prev3 = ema_series.iloc[-3]   # t-3
+
     qty = calculate_safe_quantity(symbol)
 
     msg = (
         f"**Manual check {symbol}**\n"
         f"1d open: {today_open:.4f}\n"
-        f"EMA-3: {ema_value:.4f}\n"
+        f"EMA-3 (t-2): {ema_prev2:.4f}\n"
+        f"EMA-3 (t-3): {ema_prev3:.4f}\n"
         f"Quantity: {qty:.6f}\n"
     )
 
-    if ema_value > today_open and ema_value2 < today_open:
-        msg += "→ opening LONG"
+    if ema_prev2 > today_open and ema_prev3 <= today_open:
+        msg += "→ **LONG signal** (EMA crossed above open)"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "BUY", qty)
         await update.message.reply_text(f"Result:\n{resp}")
         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
             symbol_position_state[symbol] = "LONG"
-    elif ema_value < today_open and ema_value2 > today_open:
-        msg += "→ opening SHORT"
+    elif ema_prev2 < today_open and ema_prev3 >= today_open:
+        msg += "→ **SHORT signal** (EMA crossed below open)"
         await update.message.reply_text(msg)
         resp = place_market_order(symbol, "SELL", qty)
         await update.message.reply_text(f"Result:\n{resp}")
         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
             symbol_position_state[symbol] = "SHORT"
     else:
-        msg += "→ no action"
+        msg += "→ no crossover signal"
         await update.message.reply_text(msg)
 
 # ────────────────────────────────────────────────
@@ -508,7 +520,7 @@ async def auto_check_symbols(app: Application) -> None:
                             continue
 
                     klines_1m = get_klines(symbol, "1m", 50)
-                    if not klines_1m or len(klines_1m) < 3:
+                    if not klines_1m or len(klines_1m) < 5:
                         continue
 
                     klines_1d = get_klines(symbol, "1d", 2)
@@ -520,39 +532,46 @@ async def auto_check_symbols(app: Application) -> None:
 
                     df = pd.DataFrame({"close": closes})
                     ema_indicator = EMAIndicator(close=df["close"], window=3)
-                    ema_value = ema_indicator.ema_indicator().iloc[-1]
+                    ema_series = ema_indicator.ema_indicator()
+
+                    if len(ema_series) < 3:
+                        continue
+
+                    ema_prev2 = ema_series.iloc[-2]
+                    ema_prev3 = ema_series.iloc[-3]
 
                     logger.info(
-                        f"[{symbol}] 1d open: {today_open:.4f} | EMA-3: {ema_value:.4f} | pos: {current_side or 'None'}"
+                        f"[{symbol}] open={today_open:.4f} | "
+                        f"EMA-3(t-2)={ema_prev2:.4f} | EMA-3(t-3)={ema_prev3:.4f} | pos={current_side or 'None'}"
                     )
 
-                    should_long  = ema_value > today_open
-                    should_short = ema_value < today_open
+                    should_open_long  = ema_prev2 > today_open and ema_prev3 <= today_open
+                    should_open_short = ema_prev2 < today_open and ema_prev3 >= today_open
 
                     qty = calculate_safe_quantity(symbol)
 
                     if current_side is None:
-                        if should_long:
-                            logger.info(f"→ {symbol} open LONG")
+                        if should_open_long:
+                            logger.info(f"→ {symbol} open LONG (crossover ↑)")
                             resp = place_market_order(symbol, "BUY", qty)
                             if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                                 symbol_position_state[symbol] = "LONG"
-                        elif should_short:
-                            logger.info(f"→ {symbol} open SHORT")
+                        elif should_open_short:
+                            logger.info(f"→ {symbol} open SHORT (crossover ↓)")
                             resp = place_market_order(symbol, "SELL", qty)
                             if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                                 symbol_position_state[symbol] = "SHORT"
 
-                    elif current_side == "LONG" and should_short:
-                        logger.info(f"→ {symbol} reverse LONG → SHORT")
+                    elif current_side == "LONG" and should_open_short:
+                        logger.info(f"→ {symbol} reverse LONG → SHORT (crossover ↓)")
                         close_resp = place_market_order(symbol, "SELL", qty, reduce_only=True)
                         if close_resp.get("status") in ("NEW", "FILLED"):
                             open_resp = place_market_order(symbol, "SELL", qty)
                             if open_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                                 symbol_position_state[symbol] = "SHORT"
 
-                    elif current_side == "SHORT" and should_long:
-                        logger.info(f"→ {symbol} reverse SHORT → LONG")
+                    elif current_side == "SHORT" and should_open_long:
+                        logger.info(f"→ {symbol} reverse SHORT → LONG (crossover ↑)")
                         close_resp = place_market_order(symbol, "BUY", qty, reduce_only=True)
                         if close_resp.get("status") in ("NEW", "FILLED"):
                             open_resp = place_market_order(symbol, "BUY", qty)

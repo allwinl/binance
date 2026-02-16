@@ -1,7 +1,7 @@
 # bot.py
 # Binance USDS-M Futures auto-trading bot – ALL perpetual USDT pairs
 # Strategy: HMA(9) → RSI(14 on HMA) → SMA(14 on RSI) on 4h + HMA close crossover exit/reverse
-# + 1% TAKE PROFIT order placed immediately on entry
+# + 1% TAKE PROFIT (limit order) placed immediately after entry
 # Checks every 300 seconds – no Telegram
 # ────────────────────────────────────────────────
 
@@ -58,14 +58,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────
-# State
+# State & caches
 # ────────────────────────────────────────────────
 
 monitored_symbols: Set[str] = set()
-configured: Set[str] = set()                                  # lev/margin set
-symbol_position_state: Dict[str, Optional[str]] = {}          # "LONG", "SHORT" or None
-symbol_entry_price:   Dict[str, Optional[float]] = {}         # reference price
-symbol_tp_order_id:   Dict[str, Optional[int]] = {}           # active TP orderId to cancel later
+configured: Set[str] = set()
+symbol_position_state: Dict[str, Optional[str]] = {}
+symbol_entry_price: Dict[str, Optional[float]] = {}
+symbol_tp_order_id: Dict[str, Optional[int]] = {}
+
+_price_precision_cache: Dict[str, int] = {}
 
 # ────────────────────────────────────────────────
 # Binance helpers
@@ -95,10 +97,10 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
         data = r.json()
 
         if isinstance(data, dict) and "code" in data and data["code"] < 0:
-            logger.error(f"API error {data['code']}: {data.get('msg')} | {endpoint}")
+            logger.error(f"API error | code={data['code']} | msg={data.get('msg')} | endpoint={endpoint} | params={params}")
         return data
     except Exception as e:
-        logger.error(f"Request failed {endpoint}: {e}")
+        logger.error(f"Request failed {endpoint}: {e} | params={params}")
         return {"error": str(e)}
 
 def public_get(endpoint: str, params: Dict = None) -> list | dict:
@@ -109,7 +111,7 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        logger.error(f"Public GET failed: {e}")
+        logger.error(f"Public GET failed {endpoint}: {e}")
         return []
 
 def get_all_usdt_perp_symbols() -> Set[str]:
@@ -123,6 +125,34 @@ def get_all_usdt_perp_symbols() -> Set[str]:
             s.get("quoteAsset") == "USDT"):
             symbols.add(s["symbol"])
     return symbols
+
+def get_price_precision(symbol: str) -> int:
+    if symbol in _price_precision_cache:
+        return _price_precision_cache[symbol]
+
+    data = public_get("/fapi/v1/exchangeInfo")
+    if not isinstance(data, dict):
+        logger.warning(f"No exchangeInfo → fallback precision 4 for {symbol}")
+        return 4
+
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick_size_str = f.get("tickSize", "0.0001")
+                    try:
+                        tick_size = float(tick_size_str)
+                        if tick_size > 0:
+                            prec = max(0, -int(math.log10(tick_size)))
+                            _price_precision_cache[symbol] = prec
+                            return prec
+                    except:
+                        pass
+            break
+
+    logger.warning(f"No PRICE_FILTER found → fallback 4 for {symbol}")
+    _price_precision_cache[symbol] = 4
+    return 4
 
 def ensure_leverage_and_margin(symbol: str) -> bool:
     if symbol in configured:
@@ -139,24 +169,18 @@ def ensure_leverage_and_margin(symbol: str) -> bool:
     success = True
 
     if current_lev != FIXED_LEVERAGE:
-        resp = signed_request("POST", "/fapi/v1/leverage", {
-            "symbol": symbol,
-            "leverage": FIXED_LEVERAGE
-        })
+        resp = signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": FIXED_LEVERAGE})
         if "code" in resp and resp["code"] < 0:
             success = False
 
     if current_margin != FIXED_MARGIN_TYPE:
-        resp = signed_request("POST", "/fapi/v1/marginType", {
-            "symbol": symbol,
-            "marginType": FIXED_MARGIN_TYPE
-        })
+        resp = signed_request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": FIXED_MARGIN_TYPE})
         if "code" in resp and resp["code"] < 0:
             success = False
 
     if success:
         configured.add(symbol)
-        logger.info(f"Confirmed {symbol}: {FIXED_LEVERAGE}x Isolated")
+        logger.info(f"Set/confirmed {symbol}: {FIXED_LEVERAGE}x Isolated")
     return success
 
 def get_current_position_data(symbol: str) -> dict:
@@ -178,7 +202,6 @@ def sync_position_state(symbol: str) -> None:
     current = symbol_position_state.get(symbol)
     if real_side != current:
         logger.info(f"Sync {symbol}: {current or 'None'} → {real_side or 'None'}")
-        # Clean up TP order when position changes/closes
         if symbol in symbol_tp_order_id:
             cancel_take_profit(symbol)
         symbol_position_state[symbol] = real_side
@@ -247,8 +270,13 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     return signed_request("POST", "/fapi/v1/order", params)
 
 def place_take_profit_order(symbol: str, side: str, qty: float, price: float) -> dict:
+    if price <= 0 or qty <= 0:
+        logger.warning(f"Invalid TP params for {symbol}: price={price}, qty={qty}")
+        return {"error": "Invalid TP price/qty"}
+
     qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
-    pstr = f"{price:.{get_price_precision(symbol)}}f".rstrip("0").rstrip(".")
+    prec = get_price_precision(symbol)
+    pstr = f"{price:.{prec}f}".rstrip("0").rstrip(".")
 
     params = {
         "symbol": symbol,
@@ -273,21 +301,13 @@ def cancel_take_profit(symbol: str) -> bool:
         "orderId": order_id
     })
 
-    success = "orderId" in resp or (isinstance(resp, dict) and "code" in resp and resp["code"] == -2011)
+    success = "orderId" in resp or (isinstance(resp, dict) and resp.get("code") in (-2011, -2013))  # already gone / cancelled
     if success:
         logger.info(f"Cancelled TP order {order_id} for {symbol}")
         symbol_tp_order_id[symbol] = None
     else:
         logger.warning(f"Failed to cancel TP {order_id} {symbol}: {resp}")
     return success
-
-def get_price_precision(symbol: str) -> int:
-    # Very basic fallback – in production fetch from exchangeInfo
-    if "BTC" in symbol:
-        return 2
-    if "ETH" in symbol:
-        return 2
-    return 4  # most altcoins
 
 def close_position(symbol: str) -> bool:
     pos = get_current_position_data(symbol)
@@ -301,7 +321,6 @@ def close_position(symbol: str) -> bool:
 
     success = resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED")
     if success:
-        # Cleanup
         cancel_take_profit(symbol)
         symbol_position_state[symbol] = None
         symbol_entry_price[symbol] = None
@@ -331,7 +350,7 @@ def hull_moving_average(series: pd.Series, period: int = 9) -> pd.Series:
 # ────────────────────────────────────────────────
 
 def main_loop():
-    logger.info("Auto-trading bot started – all USDT perps – 300s interval – with TP orders")
+    logger.info("Auto-trading bot started – all USDT perps – 300s interval – with fixed TP orders")
 
     while True:
         try:
@@ -340,14 +359,14 @@ def main_loop():
                 time.sleep(CHECK_INTERVAL_SECONDS)
                 continue
 
-            # Add new symbols
+            # Add new
             for sym in current_symbols - monitored_symbols:
                 if ensure_leverage_and_margin(sym):
                     monitored_symbols.add(sym)
                     symbol_position_state[sym] = None
                     logger.info(f"Added new symbol: {sym}")
 
-            # Remove gone symbols
+            # Remove gone
             for sym in monitored_symbols - current_symbols:
                 close_position(sym)
                 monitored_symbols.remove(sym)
@@ -418,7 +437,7 @@ def main_loop():
                                 tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
                                 if "orderId" in tp_resp:
                                     symbol_tp_order_id[symbol] = tp_resp["orderId"]
-                                    logger.info(f"[{symbol}] TP placed @ {tp_price:.4f}")
+                                    logger.info(f"[{symbol}] TP placed @ {tp_price:.{get_price_precision(symbol)}f}")
 
                         elif cross_down:
                             logger.info(f"[{symbol}] SHORT signal")
@@ -430,7 +449,7 @@ def main_loop():
                                 tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
                                 if "orderId" in tp_resp:
                                     symbol_tp_order_id[symbol] = tp_resp["orderId"]
-                                    logger.info(f"[{symbol}] TP placed @ {tp_price:.4f}")
+                                    logger.info(f"[{symbol}] TP placed @ {tp_price:.{get_price_precision(symbol)}f}")
 
                     elif current_side == "LONG" and last_close < last_hma:
                         logger.info(f"[{symbol}] LONG → reverse SHORT (close < HMA)")
@@ -443,6 +462,7 @@ def main_loop():
                             tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
                             if "orderId" in tp_resp:
                                 symbol_tp_order_id[symbol] = tp_resp["orderId"]
+                                logger.info(f"[{symbol}] TP placed @ {tp_price:.{get_price_precision(symbol)}f}")
 
                     elif current_side == "SHORT" and last_close > last_hma:
                         logger.info(f"[{symbol}] SHORT → reverse LONG (close > HMA)")
@@ -455,9 +475,10 @@ def main_loop():
                             tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
                             if "orderId" in tp_resp:
                                 symbol_tp_order_id[symbol] = tp_resp["orderId"]
+                                logger.info(f"[{symbol}] TP placed @ {tp_price:.{get_price_precision(symbol)}f}")
 
                 except Exception as e:
-                    logger.error(f"Error {symbol}: {e}")
+                    logger.error(f"Error processing {symbol}: {e}")
 
         except Exception as e:
             logger.error(f"Main loop error: {e}")

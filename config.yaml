@@ -3,8 +3,10 @@
 # This is for REAL Binance mainnet (live trading)
 
 binance:
-  api_key:     "swNCkZLoqzFnYPreUDrFAAnoAxsx16PcJSDlU3AEpep7MwaOCVXzq3YHUDJkZvu8"
-  api_secret:  "f7774SEvatAbZJHNP6NYZu6dtAb6zxYUBmxQp6c8d90PbNvlvKLYl1ofF7A1J4qn"
+  api_key:     "9ORkgAY8HXA0w51LUTAHkD9J5C7y4J9hrXX2NUtGuXbWzSePHlTW3daLPpdytvvM"
+  api_secret:  "iDHclDBFyQVjGXVOhnwIFMf2NEsx1wfZVJ0ksM1SAOhgb0RJtgDDXP2grfLMGmQr"
+
+
 
 trading:
   symbol:             "XRPUSDT"           # change to SOLUSDT, ETHUSDT, etc. if desired

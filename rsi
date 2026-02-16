@@ -1,7 +1,8 @@
 # bot.py
 # Binance USDS-M Futures auto-trading bot – ALL perpetual USDT pairs
 # Strategy: HMA(9) → RSI(14 on HMA) → SMA(14 on RSI) on 4h + HMA close crossover exit/reverse
-# Checks every 300 seconds – no Telegram interface
+# + 1% TAKE PROFIT order placed immediately on entry
+# Checks every 300 seconds – no Telegram
 # ────────────────────────────────────────────────
 
 import time
@@ -19,7 +20,7 @@ from ta.trend import WMAIndicator
 from ta.momentum import RSIIndicator
 
 # ────────────────────────────────────────────────
-# Load config (only binance part needed now)
+# Load config
 # ────────────────────────────────────────────────
 
 try:
@@ -60,10 +61,11 @@ logger = logging.getLogger(__name__)
 # State
 # ────────────────────────────────────────────────
 
-monitored_symbols: Set[str] = set()                           # all active USDT perp symbols
-configured: Set[str] = set()                                  # symbols where we already set lev/margin
+monitored_symbols: Set[str] = set()
+configured: Set[str] = set()                                  # lev/margin set
 symbol_position_state: Dict[str, Optional[str]] = {}          # "LONG", "SHORT" or None
-symbol_entry_price: Dict[str, Optional[float]] = {}           # for TP
+symbol_entry_price:   Dict[str, Optional[float]] = {}         # reference price
+symbol_tp_order_id:   Dict[str, Optional[int]] = {}           # active TP orderId to cancel later
 
 # ────────────────────────────────────────────────
 # Binance helpers
@@ -84,17 +86,19 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
             r = requests.get(url, headers=HEADERS, timeout=10)
         elif method.upper() == "POST":
             r = requests.post(url, headers=HEADERS, timeout=10)
+        elif method.upper() == "DELETE":
+            r = requests.delete(url, headers=HEADERS, timeout=10)
         else:
-            raise ValueError("Bad method")
+            raise ValueError(f"Unsupported method: {method}")
 
         r.raise_for_status()
         data = r.json()
 
         if isinstance(data, dict) and "code" in data and data["code"] < 0:
-            logger.error(f"API error {data['code']}: {data.get('msg')}")
+            logger.error(f"API error {data['code']}: {data.get('msg')} | {endpoint}")
         return data
     except Exception as e:
-        logger.error(f"Request failed: {e}")
+        logger.error(f"Request failed {endpoint}: {e}")
         return {"error": str(e)}
 
 def public_get(endpoint: str, params: Dict = None) -> list | dict:
@@ -111,9 +115,7 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
 def get_all_usdt_perp_symbols() -> Set[str]:
     data = public_get("/fapi/v1/exchangeInfo")
     if not isinstance(data, dict):
-        logger.error("Failed to fetch exchangeInfo")
         return set()
-
     symbols = set()
     for s in data.get("symbols", []):
         if (s.get("contractType") == "PERPETUAL" and
@@ -143,7 +145,6 @@ def ensure_leverage_and_margin(symbol: str) -> bool:
         })
         if "code" in resp and resp["code"] < 0:
             success = False
-            logger.error(f"Failed to set leverage {symbol}: {resp}")
 
     if current_margin != FIXED_MARGIN_TYPE:
         resp = signed_request("POST", "/fapi/v1/marginType", {
@@ -152,11 +153,10 @@ def ensure_leverage_and_margin(symbol: str) -> bool:
         })
         if "code" in resp and resp["code"] < 0:
             success = False
-            logger.error(f"Failed to set margin {symbol}: {resp}")
 
     if success:
         configured.add(symbol)
-        logger.info(f"Set/confirmed {symbol}: {FIXED_LEVERAGE}x Isolated")
+        logger.info(f"Confirmed {symbol}: {FIXED_LEVERAGE}x Isolated")
     return success
 
 def get_current_position_data(symbol: str) -> dict:
@@ -178,18 +178,22 @@ def sync_position_state(symbol: str) -> None:
     current = symbol_position_state.get(symbol)
     if real_side != current:
         logger.info(f"Sync {symbol}: {current or 'None'} → {real_side or 'None'}")
+        # Clean up TP order when position changes/closes
+        if symbol in symbol_tp_order_id:
+            cancel_take_profit(symbol)
         symbol_position_state[symbol] = real_side
-        if real_side is None:
-            symbol_entry_price.pop(symbol, None)
+        symbol_entry_price[symbol] = None
+        symbol_tp_order_id[symbol] = None
 
 def get_current_price(symbol: str) -> float:
     data = public_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     return float(data.get("markPrice", 0)) if isinstance(data, dict) else 0.0
 
 def get_klines(symbol: str, interval: str, limit: int = 200) -> list:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params=params, timeout=12)
+        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params={
+            "symbol": symbol, "interval": interval, "limit": limit
+        }, timeout=12)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -218,7 +222,7 @@ def calculate_safe_quantity(symbol: str) -> float:
     if price <= 0:
         return 0.001
 
-    target_usdt = min_notional * 1.1   # slight buffer
+    target_usdt = min_notional * 1.1
     raw_qty = target_usdt / price
     steps = math.ceil(raw_qty / step_size)
     qty = max(steps * step_size, min_qty)
@@ -242,6 +246,49 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     logger.info(f"ORDER {side.upper()} {qstr} {symbol} reduceOnly={reduce_only}")
     return signed_request("POST", "/fapi/v1/order", params)
 
+def place_take_profit_order(symbol: str, side: str, qty: float, price: float) -> dict:
+    qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
+    pstr = f"{price:.{get_price_precision(symbol)}}f".rstrip("0").rstrip(".")
+
+    params = {
+        "symbol": symbol,
+        "side": "SELL" if side == "LONG" else "BUY",
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": qstr,
+        "price": pstr,
+        "reduceOnly": "true",
+    }
+
+    logger.info(f"TP {params['side']} {qstr} @ {pstr} {symbol}")
+    return signed_request("POST", "/fapi/v1/order", params)
+
+def cancel_take_profit(symbol: str) -> bool:
+    order_id = symbol_tp_order_id.get(symbol)
+    if not order_id:
+        return True
+
+    resp = signed_request("DELETE", "/fapi/v1/order", {
+        "symbol": symbol,
+        "orderId": order_id
+    })
+
+    success = "orderId" in resp or (isinstance(resp, dict) and "code" in resp and resp["code"] == -2011)
+    if success:
+        logger.info(f"Cancelled TP order {order_id} for {symbol}")
+        symbol_tp_order_id[symbol] = None
+    else:
+        logger.warning(f"Failed to cancel TP {order_id} {symbol}: {resp}")
+    return success
+
+def get_price_precision(symbol: str) -> int:
+    # Very basic fallback – in production fetch from exchangeInfo
+    if "BTC" in symbol:
+        return 2
+    if "ETH" in symbol:
+        return 2
+    return 4  # most altcoins
+
 def close_position(symbol: str) -> bool:
     pos = get_current_position_data(symbol)
     if not pos:
@@ -254,15 +301,18 @@ def close_position(symbol: str) -> bool:
 
     success = resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED")
     if success:
+        # Cleanup
+        cancel_take_profit(symbol)
         symbol_position_state[symbol] = None
-        symbol_entry_price.pop(symbol, None)
+        symbol_entry_price[symbol] = None
+        symbol_tp_order_id[symbol] = None
         logger.info(f"Closed position {symbol}")
     else:
         logger.error(f"Close failed {symbol}: {resp}")
     return success
 
 # ────────────────────────────────────────────────
-# HMA implementation
+# HMA
 # ────────────────────────────────────────────────
 
 def hull_moving_average(series: pd.Series, period: int = 9) -> pd.Series:
@@ -281,36 +331,31 @@ def hull_moving_average(series: pd.Series, period: int = 9) -> pd.Series:
 # ────────────────────────────────────────────────
 
 def main_loop():
-    logger.info("Starting auto-trading bot – all USDT perpetual pairs – interval 300s")
+    logger.info("Auto-trading bot started – all USDT perps – 300s interval – with TP orders")
 
     while True:
         try:
-            # Refresh list of tradable symbols
             current_symbols = get_all_usdt_perp_symbols()
             if not current_symbols:
-                logger.warning("No symbols fetched – retrying later")
                 time.sleep(CHECK_INTERVAL_SECONDS)
                 continue
 
-            # Add newly appeared symbols
-            new_symbols = current_symbols - monitored_symbols
-            for sym in new_symbols:
+            # Add new symbols
+            for sym in current_symbols - monitored_symbols:
                 if ensure_leverage_and_margin(sym):
                     monitored_symbols.add(sym)
                     symbol_position_state[sym] = None
-                    logger.info(f"New symbol added: {sym}")
+                    logger.info(f"Added new symbol: {sym}")
 
-            # Remove delisted / non-trading symbols
-            removed = monitored_symbols - current_symbols
-            for sym in removed:
-                close_position(sym)  # try to close if open
+            # Remove gone symbols
+            for sym in monitored_symbols - current_symbols:
+                close_position(sym)
                 monitored_symbols.remove(sym)
                 symbol_position_state.pop(sym, None)
                 symbol_entry_price.pop(sym, None)
+                symbol_tp_order_id.pop(sym, None)
                 configured.discard(sym)
-                logger.info(f"Removed delisted symbol: {sym}")
-
-            logger.info(f"Monitoring {len(monitored_symbols)} symbols")
+                logger.info(f"Removed symbol: {sym}")
 
             for symbol in list(monitored_symbols):
                 try:
@@ -319,7 +364,7 @@ def main_loop():
 
                     pos_data = get_current_position_data(symbol)
 
-                    # 1. Loss cut
+                    # Loss cut
                     if pos_data:
                         pnl = float(pos_data.get("unRealizedProfit", 0))
                         if pnl < MAX_ALLOWED_LOSS_USDT:
@@ -327,27 +372,17 @@ def main_loop():
                             close_position(symbol)
                             continue
 
-                    # 2. Take profit
-                    entry = symbol_entry_price.get(symbol)
-                    if entry and pos_data:
-                        mark = get_current_price(symbol)
-                        if current_side == "LONG" and mark >= entry * (1 + TAKE_PROFIT_PCT):
-                            logger.info(f"[{symbol}] TP LONG @ {mark:.4f}")
-                            close_position(symbol)
-                            continue
-                        if current_side == "SHORT" and mark <= entry * (1 - TAKE_PROFIT_PCT):
-                            logger.info(f"[{symbol}] TP SHORT @ {mark:.4f}")
-                            close_position(symbol)
-                            continue
+                    qty = calculate_safe_quantity(symbol)
+                    if qty <= 0.000001:
+                        continue
 
-                    # 3. Strategy logic (4h)
                     klines = get_klines(symbol, "4h", 100)
                     if not klines or len(klines) < 40:
                         continue
 
                     df = pd.DataFrame(klines, columns=[
-                        "ot", "open", "high", "low", "close", "vol",
-                        "ct", "qv", "n", "tbv", "tqv", "i"
+                        "ot","open","high","low","close","vol",
+                        "ct","qv","n","tbv","tqv","i"
                     ])
                     df["close"] = df["close"].astype(float)
 
@@ -358,53 +393,71 @@ def main_loop():
                     if len(sma_rsi.dropna()) < 3:
                         continue
 
-                    # Use last completed candle (iloc[-2])
-                    last_close   = df["close"].iloc[-2]
-                    last_hma     = hma.iloc[-2]
-                    last_rsi     = rsi_hma.iloc[-2]
-                    last_sma     = sma_rsi.iloc[-2]
-                    prev_rsi     = rsi_hma.iloc[-3]
-                    prev_sma     = sma_rsi.iloc[-3]
+                    last_close = df["close"].iloc[-2]
+                    last_hma   = hma.iloc[-2]
+                    last_rsi   = rsi_hma.iloc[-2]
+                    last_sma   = sma_rsi.iloc[-2]
+                    prev_rsi   = rsi_hma.iloc[-3]
+                    prev_sma   = sma_rsi.iloc[-3]
 
                     cross_up   = (prev_rsi <= prev_sma) and (last_rsi > last_sma)
                     cross_down = (prev_rsi >= prev_sma) and (last_rsi < last_sma)
 
-                    qty = calculate_safe_quantity(symbol)
-                    if qty <= 0.000001:
+                    mark_price = get_current_price(symbol)
+                    if mark_price <= 0:
                         continue
 
                     if current_side is None:
                         if cross_up:
-                            logger.info(f"[{symbol}] → LONG signal")
-                            resp = place_market_order(symbol, "BUY", qty)
-                            if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            logger.info(f"[{symbol}] LONG signal")
+                            entry_resp = place_market_order(symbol, "BUY", qty)
+                            if entry_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                                 symbol_position_state[symbol] = "LONG"
-                                symbol_entry_price[symbol] = get_current_price(symbol)
+                                symbol_entry_price[symbol] = mark_price
+                                tp_price = mark_price * (1 + TAKE_PROFIT_PCT)
+                                tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
+                                if "orderId" in tp_resp:
+                                    symbol_tp_order_id[symbol] = tp_resp["orderId"]
+                                    logger.info(f"[{symbol}] TP placed @ {tp_price:.4f}")
+
                         elif cross_down:
-                            logger.info(f"[{symbol}] → SHORT signal")
-                            resp = place_market_order(symbol, "SELL", qty)
-                            if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            logger.info(f"[{symbol}] SHORT signal")
+                            entry_resp = place_market_order(symbol, "SELL", qty)
+                            if entry_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                                 symbol_position_state[symbol] = "SHORT"
-                                symbol_entry_price[symbol] = get_current_price(symbol)
+                                symbol_entry_price[symbol] = mark_price
+                                tp_price = mark_price * (1 - TAKE_PROFIT_PCT)
+                                tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
+                                if "orderId" in tp_resp:
+                                    symbol_tp_order_id[symbol] = tp_resp["orderId"]
+                                    logger.info(f"[{symbol}] TP placed @ {tp_price:.4f}")
 
                     elif current_side == "LONG" and last_close < last_hma:
-                        logger.info(f"[{symbol}] LONG → reverse to SHORT (close < HMA)")
+                        logger.info(f"[{symbol}] LONG → reverse SHORT (close < HMA)")
                         close_position(symbol)
-                        resp = place_market_order(symbol, "SELL", qty)
-                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                        entry_resp = place_market_order(symbol, "SELL", qty)
+                        if entry_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "SHORT"
-                            symbol_entry_price[symbol] = get_current_price(symbol)
+                            symbol_entry_price[symbol] = mark_price
+                            tp_price = mark_price * (1 - TAKE_PROFIT_PCT)
+                            tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
+                            if "orderId" in tp_resp:
+                                symbol_tp_order_id[symbol] = tp_resp["orderId"]
 
                     elif current_side == "SHORT" and last_close > last_hma:
-                        logger.info(f"[{symbol}] SHORT → reverse to LONG (close > HMA)")
+                        logger.info(f"[{symbol}] SHORT → reverse LONG (close > HMA)")
                         close_position(symbol)
-                        resp = place_market_order(symbol, "BUY", qty)
-                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                        entry_resp = place_market_order(symbol, "BUY", qty)
+                        if entry_resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "LONG"
-                            symbol_entry_price[symbol] = get_current_price(symbol)
+                            symbol_entry_price[symbol] = mark_price
+                            tp_price = mark_price * (1 + TAKE_PROFIT_PCT)
+                            tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
+                            if "orderId" in tp_resp:
+                                symbol_tp_order_id[symbol] = tp_resp["orderId"]
 
                 except Exception as e:
-                    logger.error(f"Error processing {symbol}: {e}")
+                    logger.error(f"Error {symbol}: {e}")
 
         except Exception as e:
             logger.error(f"Main loop error: {e}")

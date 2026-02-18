@@ -427,13 +427,15 @@ def main_loop():
 
                     last_close = df["close"].iloc[-2]
                     last_hma   = hma.iloc[-2]
+                    prev_hma   = hma.iloc[-3]
+                    prev1_hma   = hma.iloc[-4]
                     last_rsi   = rsi_hma.iloc[-2]
                     last_sma   = sma_rsi.iloc[-2]
                     prev_rsi   = rsi_hma.iloc[-3]
                     prev_sma   = sma_rsi.iloc[-3]
 
-                    cross_up   = (prev_rsi <= prev_sma) and (last_rsi > last_sma)
-                    cross_down = (prev_rsi >= prev_sma) and (last_rsi < last_sma)
+                    cross_up   = (last_hma >= prev_hma) and (prev_hma < prev1_hma)
+                    cross_down = (last_hma <= prev_hma) and (prev_hma > prev1_hma)
 
                     mark_price = get_current_price(symbol)
                     if mark_price <= 0:

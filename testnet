@@ -57,7 +57,7 @@ FIXED_MARGIN_TYPE = "ISOLATED"
 CHECK_INTERVAL_SECONDS = 300
 POSITION_TOLERANCE     = 1e-6
 MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -10.0)
-TAKE_PROFIT_PCT        = 0.01  # 1%
+TAKE_PROFIT_PCT        = 0.1  # 1%
 
 if not API_KEY or not API_SECRET:
     print("ERROR: Missing api_key or api_secret in config.yaml")

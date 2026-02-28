@@ -505,8 +505,8 @@ async def trading_loop(_: Application) -> None:
                 mark_price = get_current_price(symbol)
                 if mark_price <= 0: continue
 
-                cross_up   = (last_rsi > last_sma) and (prev_rsi <= prev_sma)
-                cross_down = (last_rsi < last_sma) and (prev_rsi >= prev_sma)
+                cross_up   = (last_sma > prev_sma) and (prev_sma < prev1_sma)
+                cross_down = (last_sma < prev_sma) and (prev_sma > prev1_sma)
 
                 # ─── New position ───────────────────────────────────────
                 if current_side is None:

@@ -489,7 +489,7 @@ async def trading_loop(_: Application) -> None:
 
                 hma = hull_moving_average(df["close"], 9)
                 rsi_hma = RSIIndicator(hma.dropna(), window=14).rsi()
-                sma_rsi = rsi_hma.rolling(14).mean()               # ← was 5, most probably typo
+                sma_rsi = rsi_hma.rolling(5).mean()               # ← was 5, most probably typo
 
                 if len(sma_rsi.dropna()) < 5: continue
 

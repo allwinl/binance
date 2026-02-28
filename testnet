@@ -64,7 +64,7 @@ else:
 
 FIXED_LEVERAGE   = 5
 FIXED_MARGIN_TYPE = "ISOLATED"
-CHECK_INTERVAL_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 60
 POSITION_TOLERANCE     = 1e-6
 MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -10.0)
 TAKE_PROFIT_PCT        = 0.006   # ← 0.6%
@@ -424,7 +424,7 @@ async def trading_loop(_: Application) -> None:
 
                 hma = hull_moving_average(df["close"], 9)
                 rsi_hma = RSIIndicator(hma, window=14).rsi()
-                sma_rsi = rsi_hma.rolling(14).mean()
+                sma_rsi = rsi_hma.rolling(5).mean()
 
                 if len(sma_rsi.dropna()) < 3: continue
 
@@ -433,14 +433,15 @@ async def trading_loop(_: Application) -> None:
                 prev_rsi = rsi_hma.iloc[-3]
                 last_sma = sma_rsi.iloc[-2]
                 prev_sma = sma_rsi.iloc[-3]
+                prev1_sma = sma_rsi.iloc[-4]
                 last_close = df["close"].iloc[-2]
                 last_hma   = hma.iloc[-2]
 
                 mark_price = get_current_price(symbol)
                 if mark_price <= 0: continue
 
-                cross_up   = (last_rsi >= last_sma) and (prev_rsi < prev_sma)
-                cross_down = (last_rsi <= last_sma) and (prev_rsi > prev_sma)
+                cross_up   = (last_sma > prev_sma) and (prev_sma < prev1_sma)
+                cross_down = (last_sma < prev_sma) and (prev_sma > prev1_sma)
 
                 if current_side is None:
                     if cross_up:
@@ -467,7 +468,7 @@ async def trading_loop(_: Application) -> None:
                                 symbol_tp_order_id[symbol] = tp["orderId"]
                                 logger.info(f"[{symbol}] TP @ {tp_price:.{get_price_precision(symbol)}f}")
 
-                elif current_side == "LONG" and last_close < last_hma:
+                elif current_side == "LONG" and (last_rsi < prev_rsi):
                     logger.info(f"[{symbol}] LONG → SHORT (close < HMA)")
                     close_position(symbol)
                     resp = place_market_order(symbol, "SELL", qty)
@@ -479,7 +480,7 @@ async def trading_loop(_: Application) -> None:
                         if "orderId" in tp:
                             symbol_tp_order_id[symbol] = tp["orderId"]
 
-                elif current_side == "SHORT" and last_close > last_hma:
+                elif current_side == "SHORT" and (last_rsi > prev_rsi):
                     logger.info(f"[{symbol}] SHORT → LONG (close > HMA)")
                     close_position(symbol)
                     resp = place_market_order(symbol, "BUY", qty)

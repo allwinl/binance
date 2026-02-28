@@ -7,17 +7,10 @@ binance:
   api_secret:  "iDHclDBFyQVjGXVOhnwIFMf2NEsx1wfZVJ0ksM1SAOhgb0RJtgDDXP2grfLMGmQr"
 
 
-
-trading:
-  symbol:             "XRPUSDT"           # change to SOLUSDT, ETHUSDT, etc. if desired
-  leverage:           5                   # start low (1–20 recommended for testing)
-  margin_type:        "ISOLATED"          # or "CROSSED"
-  default_quantity:   5             # very small – adjust according to symbol precision
-  use_testnet: true
-
-
-
-
-
 telegram:
   token: 7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0
+
+
+trading:
+  use_testnet: true          # ← change to false for real trading!
+  max_allowed_loss_usdt: -10.0

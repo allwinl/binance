@@ -553,7 +553,7 @@ async def trading_loop(_: Application) -> None:
                             await send_telegram(msg)
 
                 # ─── Reversal / exit condition ──────────────────────────
-                elif current_side == "LONG" and last_close < last_hma:
+                elif current_side == "LONG" and last_rsi < prev_rsi:
                     logger.info(f"[{symbol}] LONG → SHORT (close < HMA)")
                     close_position(symbol, "reversal")
                     await send_telegram(f"🔄 Reversal {symbol} → closing LONG")
@@ -576,7 +576,7 @@ async def trading_loop(_: Application) -> None:
                         msg = f"🔴 SHORT {symbol} @ {mark_price:.3f} (reversal)\nTP {tp_price:.3f}  |  SL {sl_price:.3f}"
                         await send_telegram(msg)
 
-                elif current_side == "SHORT" and last_close > last_hma:
+                elif current_side == "SHORT" and last_rsi > prev_rsi:
                     logger.info(f"[{symbol}] SHORT → LONG (close > HMA)")
                     close_position(symbol, "reversal")
                     await send_telegram(f"🔄 Reversal {symbol} → closing SHORT")

@@ -23,6 +23,7 @@ from typing import Dict, Set, Optional
 import pandas as pd
 import numpy as np
 import math
+import asyncio
 from ta.trend import WMAIndicator
 from ta.momentum import RSIIndicator
 

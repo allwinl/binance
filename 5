@@ -3,7 +3,7 @@
 # Strategy: EMA(14) → RSI(14 on EMA) → SMA(5 on RSI) on 1m
 # Entry: SMA(5) direction
 # Exit/Reverse: RSI(14) slope reversal
-# TP 0.6%  /  SL -0.9% (STOP_MARKET with priceProtect & mark price trigger)
+# TP 0.6%  /  SL -0.9% (STOP_MARKET with closePosition=true)
 # Checks every 60 seconds
 #
 # TESTNET SUPPORT: set USE_TESTNET = True
@@ -295,21 +295,21 @@ def place_take_profit_order(symbol: str, side: str, qty: float, price: float) ->
     logger.info(f"TP {params['side']} {qstr} @ {pstr} {symbol}")
     return signed_request("POST", "/fapi/v1/order", params)
 
-def place_stop_loss_order(symbol: str, side: str, qty: float, stop_price: float) -> dict:
+def place_stop_loss_order(symbol: str, side: str, stop_price: float) -> dict:
     prec = get_price_precision(symbol)
     pstr = f"{stop_price:.{prec}f}".rstrip("0").rstrip(".")
-    qstr = f"{qty:.{get_qty_precision(symbol)}f}".rstrip("0").rstrip(".")
+
     params = {
         "symbol": symbol,
         "side": "SELL" if side == "LONG" else "BUY",
         "type": "STOP_MARKET",
-        "quantity": qstr,
         "stopPrice": pstr,
+        "closePosition": "true",
         "reduceOnly": "true",
-        "priceProtect": "true",           # ← Key fix for many 400 / reject cases
-        "workingType": "MARK_PRICE",      # ← Safer trigger (mark price)
+        "priceProtect": "true",
+        "workingType": "MARK_PRICE",
     }
-    logger.info(f"SL {params['side']} qty={qstr} stop={pstr} {symbol} (priceProtect + MARK_PRICE)")
+    logger.info(f"SL {params['side']} FULL close @ stop={pstr} {symbol} (closePosition + priceProtect)")
     return signed_request("POST", "/fapi/v1/order", params)
 
 def close_position(symbol: str) -> bool:
@@ -416,7 +416,7 @@ def main_loop():
                                 sl_price = mark_price * (1 - STOP_LOSS_PCT)
 
                                 tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
-                                sl_resp = place_stop_loss_order(symbol, "LONG", qty, sl_price)
+                                sl_resp = place_stop_loss_order(symbol, "LONG", sl_price)
 
                                 if "orderId" in tp_resp:
                                     symbol_tp_order_id[symbol] = tp_resp["orderId"]
@@ -438,7 +438,7 @@ def main_loop():
                                 sl_price = mark_price * (1 + STOP_LOSS_PCT)
 
                                 tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
-                                sl_resp = place_stop_loss_order(symbol, "SHORT", qty, sl_price)
+                                sl_resp = place_stop_loss_order(symbol, "SHORT", sl_price)
 
                                 if "orderId" in tp_resp:
                                     symbol_tp_order_id[symbol] = tp_resp["orderId"]
@@ -459,7 +459,7 @@ def main_loop():
                             tp_price = mark_price * (1 - TAKE_PROFIT_PCT)
                             sl_price = mark_price * (1 + STOP_LOSS_PCT)
                             tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
-                            sl_resp = place_stop_loss_order(symbol, "SHORT", qty, sl_price)
+                            sl_resp = place_stop_loss_order(symbol, "SHORT", sl_price)
                             if "orderId" in tp_resp:
                                 symbol_tp_order_id[symbol] = tp_resp["orderId"]
                             if "orderId" in sl_resp:
@@ -475,7 +475,7 @@ def main_loop():
                             tp_price = mark_price * (1 + TAKE_PROFIT_PCT)
                             sl_price = mark_price * (1 - STOP_LOSS_PCT)
                             tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
-                            sl_resp = place_stop_loss_order(symbol, "LONG", qty, sl_price)
+                            sl_resp = place_stop_loss_order(symbol, "LONG", sl_price)
                             if "orderId" in tp_resp:
                                 symbol_tp_order_id[symbol] = tp_resp["orderId"]
                             if "orderId" in sl_resp:

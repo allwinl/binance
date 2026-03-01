@@ -3,9 +3,10 @@
 # Strategy: EMA(14) → RSI(14 on EMA) → SMA(5 on RSI) on 1m
 # Entry: SMA(5) direction
 # Exit/Reverse: RSI(14) slope reversal
-# TP 0.6%  /  SL -0.9% (STOP_MARKET with closePosition=true)
+# TP 0.6% (LIMIT) / SL -0.9% (Algo STOP_MARKET + closePosition)
 # Checks every 60 seconds
 #
+# IMPORTANT: SL uses Algo API (/fapi/v1/algo/new) due to 2025 migration
 # TESTNET SUPPORT: set USE_TESTNET = True
 # ────────────────────────────────────────────────
 
@@ -80,7 +81,7 @@ configured: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}
 symbol_entry_price: Dict[str, Optional[float]] = {}
 symbol_tp_order_id: Dict[str, Optional[int]] = {}
-symbol_sl_order_id: Dict[str, Optional[int]] = {}
+symbol_sl_algo_id: Dict[str, Optional[int]] = {}  # Now algoId, not orderId
 
 _price_precision_cache: Dict[str, int] = {}
 _qty_precision_cache: Dict[str, int] = {}
@@ -218,11 +219,17 @@ def sync_position_state(symbol: str) -> None:
         symbol_entry_price[symbol] = None
 
 def cancel_bracket_orders(symbol: str) -> None:
-    for oid in [symbol_tp_order_id.get(symbol), symbol_sl_order_id.get(symbol)]:
-        if oid:
-            signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": oid})
-    symbol_tp_order_id[symbol] = None
-    symbol_sl_order_id[symbol] = None
+    # Cancel TP (legacy orderId)
+    tp_id = symbol_tp_order_id.get(symbol)
+    if tp_id:
+        signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": tp_id})
+        symbol_tp_order_id[symbol] = None
+
+    # Cancel SL (algoId)
+    sl_algo_id = symbol_sl_algo_id.get(symbol)
+    if sl_algo_id:
+        signed_request("DELETE", "/fapi/v1/algo/cancel", {"symbol": symbol, "algoId": sl_algo_id})
+        symbol_sl_algo_id[symbol] = None
 
 def get_current_price(symbol: str) -> float:
     data = public_get("/fapi/v1/premiumIndex", {"symbol": symbol})
@@ -295,7 +302,7 @@ def place_take_profit_order(symbol: str, side: str, qty: float, price: float) ->
     logger.info(f"TP {params['side']} {qstr} @ {pstr} {symbol}")
     return signed_request("POST", "/fapi/v1/order", params)
 
-def place_stop_loss_order(symbol: str, side: str, stop_price: float) -> dict:
+def place_algo_stop_order(symbol: str, side: str, stop_price: float) -> dict:
     prec = get_price_precision(symbol)
     pstr = f"{stop_price:.{prec}f}".rstrip("0").rstrip(".")
 
@@ -309,8 +316,8 @@ def place_stop_loss_order(symbol: str, side: str, stop_price: float) -> dict:
         "priceProtect": "true",
         "workingType": "MARK_PRICE",
     }
-    logger.info(f"SL {params['side']} FULL close @ stop={pstr} {symbol} (closePosition + priceProtect)")
-    return signed_request("POST", "/fapi/v1/order", params)
+    logger.info(f"ALGO SL {params['side']} FULL close @ stop={pstr} {symbol}")
+    return signed_request("POST", "/fapi/v1/algo/new", params)
 
 def close_position(symbol: str) -> bool:
     pos = get_current_position_data(symbol)
@@ -357,7 +364,7 @@ def main_loop():
                 symbol_position_state.pop(sym, None)
                 symbol_entry_price.pop(sym, None)
                 symbol_tp_order_id.pop(sym, None)
-                symbol_sl_order_id.pop(sym, None)
+                symbol_sl_algo_id.pop(sym, None)
                 configured.discard(sym)
                 logger.info(f"Removed {sym}")
 
@@ -416,16 +423,16 @@ def main_loop():
                                 sl_price = mark_price * (1 - STOP_LOSS_PCT)
 
                                 tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
-                                sl_resp = place_stop_loss_order(symbol, "LONG", sl_price)
+                                sl_resp = place_algo_stop_order(symbol, "LONG", sl_price)
 
                                 if "orderId" in tp_resp:
                                     symbol_tp_order_id[symbol] = tp_resp["orderId"]
-                                if "orderId" in sl_resp:
-                                    symbol_sl_order_id[symbol] = sl_resp["orderId"]
+                                if "algoId" in sl_resp:
+                                    symbol_sl_algo_id[symbol] = sl_resp["algoId"]
                                 else:
-                                    logger.error(f"SL placement FAILED for {symbol} LONG: {sl_resp}")
+                                    logger.error(f"Algo SL placement FAILED for {symbol} LONG: {sl_resp}")
 
-                                logger.info(f"[{symbol}] LONG @ {mark_price:.6f} | TP {tp_price:.6f} | SL {sl_price:.6f}")
+                                logger.info(f"[{symbol}] LONG @ {mark_price:.6f} | TP {tp_price:.6f} | SL stop {sl_price:.6f}")
 
                         elif last_sma < prev_sma:
                             logger.info(f"[{symbol}] SHORT signal")
@@ -438,16 +445,16 @@ def main_loop():
                                 sl_price = mark_price * (1 + STOP_LOSS_PCT)
 
                                 tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
-                                sl_resp = place_stop_loss_order(symbol, "SHORT", sl_price)
+                                sl_resp = place_algo_stop_order(symbol, "SHORT", sl_price)
 
                                 if "orderId" in tp_resp:
                                     symbol_tp_order_id[symbol] = tp_resp["orderId"]
-                                if "orderId" in sl_resp:
-                                    symbol_sl_order_id[symbol] = sl_resp["orderId"]
+                                if "algoId" in sl_resp:
+                                    symbol_sl_algo_id[symbol] = sl_resp["algoId"]
                                 else:
-                                    logger.error(f"SL placement FAILED for {symbol} SHORT: {sl_resp}")
+                                    logger.error(f"Algo SL placement FAILED for {symbol} SHORT: {sl_resp}")
 
-                                logger.info(f"[{symbol}] SHORT @ {mark_price:.6f} | TP {tp_price:.6f} | SL {sl_price:.6f}")
+                                logger.info(f"[{symbol}] SHORT @ {mark_price:.6f} | TP {tp_price:.6f} | SL stop {sl_price:.6f}")
 
                     elif current_side == "LONG" and last_rsi < prev_rsi:
                         logger.info(f"[{symbol}] LONG → reverse SHORT (RSI ↓)")
@@ -459,11 +466,11 @@ def main_loop():
                             tp_price = mark_price * (1 - TAKE_PROFIT_PCT)
                             sl_price = mark_price * (1 + STOP_LOSS_PCT)
                             tp_resp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
-                            sl_resp = place_stop_loss_order(symbol, "SHORT", sl_price)
+                            sl_resp = place_algo_stop_order(symbol, "SHORT", sl_price)
                             if "orderId" in tp_resp:
                                 symbol_tp_order_id[symbol] = tp_resp["orderId"]
-                            if "orderId" in sl_resp:
-                                symbol_sl_order_id[symbol] = sl_resp["orderId"]
+                            if "algoId" in sl_resp:
+                                symbol_sl_algo_id[symbol] = sl_resp["algoId"]
 
                     elif current_side == "SHORT" and last_rsi > prev_rsi:
                         logger.info(f"[{symbol}] SHORT → reverse LONG (RSI ↑)")
@@ -475,11 +482,11 @@ def main_loop():
                             tp_price = mark_price * (1 + TAKE_PROFIT_PCT)
                             sl_price = mark_price * (1 - STOP_LOSS_PCT)
                             tp_resp = place_take_profit_order(symbol, "LONG", qty, tp_price)
-                            sl_resp = place_stop_loss_order(symbol, "LONG", sl_price)
+                            sl_resp = place_algo_stop_order(symbol, "LONG", sl_price)
                             if "orderId" in tp_resp:
                                 symbol_tp_order_id[symbol] = tp_resp["orderId"]
-                            if "orderId" in sl_resp:
-                                symbol_sl_order_id[symbol] = sl_resp["orderId"]
+                            if "algoId" in sl_resp:
+                                symbol_sl_algo_id[symbol] = sl_resp["algoId"]
 
                 except Exception as e:
                     logger.error(f"Error processing {symbol}: {e}")

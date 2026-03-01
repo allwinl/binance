@@ -336,7 +336,7 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "1m EMA→RSI→SMA bot\n"
+        "5m EMA→RSI→SMA bot\n"
         "Entry LONG: SMA(5) ↑\n"
         "Entry SHORT: SMA(5) ↓\n"
         "Conditional reversal:\n"
@@ -443,7 +443,7 @@ async def trading_loop(_: Application) -> None:
                 if qty < 1e-5:
                     continue
 
-                klines = get_klines(symbol, "1m", 150)
+                klines = get_klines(symbol, "5m", 150)
                 if not klines or len(klines) < 60:
                     continue
 
@@ -460,7 +460,8 @@ async def trading_loop(_: Application) -> None:
                     continue
 
                 curr_sma = sma5.iloc[-2]
-                prev_sma = sma5.iloc[-3]
+                last_sma = sma5.iloc[-3]
+                prev_sma = sma5.iloc[-4]
                 curr_rsi = rsi.iloc[-2]
                 prev_rsi = rsi.iloc[-3]
 
@@ -471,8 +472,8 @@ async def trading_loop(_: Application) -> None:
                 if mark_price <= 0:
                     continue
 
-                sma_rising  = curr_sma > prev_sma
-                sma_falling = curr_sma < prev_sma
+                sma_rising  = curr_sma > last_sma and last_sma < prev_sma
+                sma_falling = curr_sma < last_sma and last_sma > prev_sma
                 rsi_rising  = curr_rsi > prev_rsi
                 rsi_falling = curr_rsi < prev_rsi
 

@@ -1,7 +1,7 @@
 # bot.py
 # Binance USDS-M Futures – selected perpetual USDT pairs (Telegram controlled)
 # Strategy:
-#   - 5m candles
+#   - 1m candles
 #   - HMA(9) on close
 #   - RSI(14) applied to HMA values
 #   - SMA(14) on that RSI        ← note: you had rolling(5) in code → changed comment
@@ -368,7 +368,7 @@ def hull_moving_average(series: pd.Series, period: int = 9) -> pd.Series:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "RSI-on-HMA(9) crossover bot – 5m timeframe\n\n"
+        "RSI-on-HMA(9) crossover bot – 1m timeframe\n\n"
         "LONG: RSI(14 on HMA) crosses ABOVE SMA(14 on RSI)\n"
         "SHORT: RSI crosses BELOW SMA\n"
         "TP: 0.6%  |  SL: 0.9%\n"
@@ -447,7 +447,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info(f"Started – 5m RSI-on-HMA – TP {TAKE_PROFIT_PCT*100:.1f}% / SL {STOP_LOSS_PCT*100:.1f}% – {len(monitored_symbols)} symbols")
+    logger.info(f"Started – 1m RSI-on-HMA – TP {TAKE_PROFIT_PCT*100:.1f}% / SL {STOP_LOSS_PCT*100:.1f}% – {len(monitored_symbols)} symbols")
     while True:
         if not monitored_symbols:
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
@@ -478,7 +478,7 @@ async def trading_loop(_: Application) -> None:
                 qty = calculate_safe_quantity(symbol)
                 if qty < 1e-6: continue
 
-                klines = get_klines(symbol, "5m", 200)
+                klines = get_klines(symbol, "1m", 200)
                 if not klines or len(klines) < 50: continue
 
                 df = pd.DataFrame(klines, columns=[

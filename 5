@@ -17,7 +17,7 @@ import numpy as np
 import math
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 
 # ── Telegram imports ──
@@ -83,7 +83,7 @@ telegram_bot = Bot(token=TELEGRAM_TOKEN)
 # State
 # ────────────────────────────────────────────────
 
-monitored_symbols: Set[str] = set()  # empty → add via /add
+monitored_symbols: Set[str] = set()
 configured: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}
 symbol_entry_price: Dict[str, Optional[float]] = {}
@@ -213,17 +213,41 @@ def sync_position_state(symbol: str) -> None:
         symbol_position_state[symbol] = real_side
         symbol_entry_price[symbol] = None
         symbol_tp_order_id[symbol] = None
-        last_entry_time[symbol] = datetime.utcnow()
+        last_entry_time[symbol] = datetime.now(timezone.utc)
 
 def cancel_take_profit(symbol: str) -> bool:
     oid = symbol_tp_order_id.get(symbol)
     if not oid:
         return True
-    resp = signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": oid})
-    success = "orderId" in resp or (isinstance(resp, dict) and resp.get("code") in (-2011, -2013))
-    if success:
+
+    params = {
+        "symbol": symbol,
+        "orderId": int(oid),  # ensure integer
+        "recvWindow": 5000,
+    }
+
+    resp = signed_request("DELETE", "/fapi/v1/order", params)
+
+    if isinstance(resp, dict):
+        code = resp.get("code")
+        msg = resp.get("msg", "")
+
+        if code in (-2011, -2013):  # Order does not exist / already cancelled
+            logger.info(f"Cancel TP {symbol} order {oid}: already gone ({msg})")
+            symbol_tp_order_id[symbol] = None
+            return True
+
+        if code is not None and code < 0:
+            logger.error(f"Cancel TP failed {symbol} #{oid}: code={code} msg={msg} full_resp={resp}")
+            return False
+
+    if "orderId" in resp:
+        logger.info(f"Cancelled TP {symbol} order {oid}")
         symbol_tp_order_id[symbol] = None
-    return success
+        return True
+
+    logger.warning(f"Unexpected cancel response for {symbol} #{oid}: {resp}")
+    return False
 
 def get_current_price(symbol: str) -> float:
     data = public_get("/fapi/v1/premiumIndex", {"symbol": symbol})
@@ -277,7 +301,10 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     }
     if reduce_only:
         params["reduceOnly"] = "true"
-    return signed_request("POST", "/fapi/v1/order", params)
+    resp = signed_request("POST", "/fapi/v1/order", params)
+    if "orderId" in resp:
+        logger.info(f"Placed MARKET {side} {symbol} qty={qstr} orderId={resp['orderId']}")
+    return resp
 
 def place_take_profit_order(symbol: str, side: str, qty: float, price: float) -> dict:
     pstr = f"{price:.{get_price_precision(symbol)}f}".rstrip("0").rstrip(".")
@@ -291,7 +318,10 @@ def place_take_profit_order(symbol: str, side: str, qty: float, price: float) ->
         "price": pstr,
         "reduceOnly": "true",
     }
-    return signed_request("POST", "/fapi/v1/order", params)
+    resp = signed_request("POST", "/fapi/v1/order", params)
+    if "orderId" in resp:
+        logger.info(f"Placed TP {symbol} {side} @ {pstr} qty={qstr} orderId={resp['orderId']}")
+    return resp
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
     pos = get_current_position_data(symbol)
@@ -307,7 +337,7 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
         symbol_position_state[symbol] = None
         symbol_entry_price[symbol] = None
         symbol_tp_order_id[symbol] = None
-        last_entry_time[symbol] = datetime.utcnow()
+        last_entry_time[symbol] = datetime.now(timezone.utc)
         asyncio.create_task(send_telegram(f"Closed {symbol} ({reason})"))
     return success
 
@@ -442,7 +472,7 @@ async def trading_loop(_: Application) -> None:
 
                 can_enter = True
                 if symbol in last_entry_time and last_entry_time[symbol]:
-                    if datetime.utcnow() - last_entry_time[symbol] < timedelta(seconds=90):
+                    if datetime.now(timezone.utc) - last_entry_time[symbol] < timedelta(seconds=90):
                         can_enter = False
 
                 if current_side is None and can_enter:
@@ -459,7 +489,7 @@ async def trading_loop(_: Application) -> None:
                                 f"🟢 LONG {symbol} @ {mark_price:.6f} TP {tp_price:.6f}",
                                 silent=False
                             )
-                            last_entry_time[symbol] = datetime.utcnow()
+                            last_entry_time[symbol] = datetime.now(timezone.utc)
 
                     elif last_sma < prev_sma:
                         resp = place_market_order(symbol, "SELL", qty)
@@ -474,7 +504,7 @@ async def trading_loop(_: Application) -> None:
                                 f"🔴 SHORT {symbol} @ {mark_price:.6f} TP {tp_price:.6f}",
                                 silent=False
                             )
-                            last_entry_time[symbol] = datetime.utcnow()
+                            last_entry_time[symbol] = datetime.now(timezone.utc)
 
                 elif current_side == "LONG" and last_rsi < prev_rsi:
                     close_position(symbol, "RSI reversal")
@@ -488,7 +518,7 @@ async def trading_loop(_: Application) -> None:
                         if "orderId" in tp_resp:
                             symbol_tp_order_id[symbol] = tp_resp["orderId"]
                         await send_telegram(f"🔴 SHORT {symbol} (reversal)", silent=False)
-                        last_entry_time[symbol] = datetime.utcnow()
+                        last_entry_time[symbol] = datetime.now(timezone.utc)
 
                 elif current_side == "SHORT" and last_rsi > prev_rsi:
                     close_position(symbol, "RSI reversal")
@@ -502,7 +532,7 @@ async def trading_loop(_: Application) -> None:
                         if "orderId" in tp_resp:
                             symbol_tp_order_id[symbol] = tp_resp["orderId"]
                         await send_telegram(f"🟢 LONG {symbol} (reversal)", silent=False)
-                        last_entry_time[symbol] = datetime.utcnow()
+                        last_entry_time[symbol] = datetime.now(timezone.utc)
 
                 # Detect TP / external close
                 if current_side and symbol_entry_price.get(symbol):
@@ -517,7 +547,7 @@ async def trading_loop(_: Application) -> None:
                         symbol_position_state[symbol] = None
                         symbol_entry_price[symbol] = None
                         symbol_tp_order_id[symbol] = None
-                        last_entry_time[symbol] = datetime.utcnow()
+                        last_entry_time[symbol] = datetime.now(timezone.utc)
 
             except Exception as e:
                 logger.error(f"[{symbol}] {e}")

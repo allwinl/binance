@@ -147,6 +147,15 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
         logger.error(f"Public GET failed {endpoint}: {e}")
         return []
 
+def symbol_exists_on_exchange(symbol: str) -> bool:
+    data = public_get("/fapi/v1/exchangeInfo")
+    if not isinstance(data, dict) or "symbols" not in data:
+        return False
+    for s in data["symbols"]:
+        if s["symbol"] == symbol and s.get("status") == "TRADING":
+            return True
+    return False
+
 def get_price_precision(symbol: str) -> int:
     if symbol in _price_precision_cache:
         return _price_precision_cache[symbol]
@@ -181,6 +190,9 @@ def ensure_leverage_and_margin(symbol: str) -> bool:
     if symbol in configured:
         return True
     pos_data = signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    if isinstance(pos_data, dict) and "code" in pos_data and pos_data["code"] == -1121:
+        logger.error(f"Symbol {symbol} invalid / not found on exchange")
+        return False
     if not isinstance(pos_data, list) or not pos_data:
         return False
     pos = pos_data[0]
@@ -304,6 +316,9 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     resp = signed_request("POST", "/fapi/v1/order", params)
     if "orderId" in resp:
         logger.info(f"Placed MARKET {side} {symbol} qty={qstr} orderId={resp['orderId']}")
+    elif "code" in resp and resp["code"] == -1121:
+        logger.error(f"Invalid symbol {symbol} - order failed")
+        asyncio.create_task(send_telegram(f"⚠️ Invalid symbol {symbol} - cannot place order"))
     return resp
 
 def place_take_profit_order(symbol: str, side: str, qty: float, price: float) -> dict:
@@ -321,6 +336,9 @@ def place_take_profit_order(symbol: str, side: str, qty: float, price: float) ->
     resp = signed_request("POST", "/fapi/v1/order", params)
     if "orderId" in resp:
         logger.info(f"Placed TP {symbol} {side} @ {pstr} qty={qstr} orderId={resp['orderId']}")
+    elif "code" in resp and resp["code"] == -1121:
+        logger.error(f"Invalid symbol {symbol} - TP order failed")
+        asyncio.create_task(send_telegram(f"⚠️ Invalid symbol {symbol} - cannot place TP"))
     return resp
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
@@ -367,6 +385,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if sym in monitored_symbols:
         await update.message.reply_text(f"{sym} already monitored")
         return
+    
+    if not symbol_exists_on_exchange(sym):
+        await update.message.reply_text(f"Symbol {sym} does NOT exist or is not trading on this exchange (testnet/mainnet). Check spelling or availability.")
+        await send_telegram(f"Rejected add: {sym} – invalid symbol", silent=False)
+        return
+    
     if ensure_leverage_and_margin(sym):
         monitored_symbols.add(sym)
         symbol_position_state[sym] = None
@@ -429,6 +453,12 @@ async def trading_loop(_: Application) -> None:
     while True:
         for symbol in list(monitored_symbols):
             try:
+                if not symbol_exists_on_exchange(symbol):
+                    logger.error(f"Symbol {symbol} no longer valid - removing")
+                    await send_telegram(f"⚠️ Symbol {symbol} invalid - removed automatically")
+                    monitored_symbols.remove(symbol)
+                    continue
+
                 sync_position_state(symbol)
                 current_side = symbol_position_state.get(symbol)
 
@@ -490,6 +520,8 @@ async def trading_loop(_: Application) -> None:
                                 silent=False
                             )
                             last_entry_time[symbol] = datetime.now(timezone.utc)
+                        elif "code" in resp and resp["code"] == -1121:
+                            monitored_symbols.remove(symbol)
 
                     elif last_sma < prev_sma:
                         resp = place_market_order(symbol, "SELL", qty)
@@ -505,6 +537,8 @@ async def trading_loop(_: Application) -> None:
                                 silent=False
                             )
                             last_entry_time[symbol] = datetime.now(timezone.utc)
+                        elif "code" in resp and resp["code"] == -1121:
+                            monitored_symbols.remove(symbol)
 
                 elif current_side == "LONG" and last_rsi < prev_rsi:
                     close_position(symbol, "RSI reversal")
@@ -519,6 +553,8 @@ async def trading_loop(_: Application) -> None:
                             symbol_tp_order_id[symbol] = tp_resp["orderId"]
                         await send_telegram(f"🔴 SHORT {symbol} (reversal)", silent=False)
                         last_entry_time[symbol] = datetime.now(timezone.utc)
+                    elif "code" in resp and resp["code"] == -1121:
+                        monitored_symbols.remove(symbol)
 
                 elif current_side == "SHORT" and last_rsi > prev_rsi:
                     close_position(symbol, "RSI reversal")
@@ -533,6 +569,8 @@ async def trading_loop(_: Application) -> None:
                             symbol_tp_order_id[symbol] = tp_resp["orderId"]
                         await send_telegram(f"🟢 LONG {symbol} (reversal)", silent=False)
                         last_entry_time[symbol] = datetime.now(timezone.utc)
+                    elif "code" in resp and resp["code"] == -1121:
+                        monitored_symbols.remove(symbol)
 
                 # Detect TP / external close
                 if current_side and symbol_entry_price.get(symbol):

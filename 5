@@ -336,7 +336,7 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "5m EMA→RSI→SMA bot\n"
+        "15m EMA→RSI→SMA bot\n"
         "Entry LONG: SMA(5) ↑\n"
         "Entry SHORT: SMA(5) ↓\n"
         "Conditional reversal:\n"
@@ -443,7 +443,7 @@ async def trading_loop(_: Application) -> None:
                 if qty < 1e-5:
                     continue
 
-                klines = get_klines(symbol, "5m", 150)
+                klines = get_klines(symbol, "15m", 150)
                 if not klines or len(klines) < 60:
                     continue
 

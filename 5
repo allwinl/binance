@@ -497,7 +497,7 @@ async def trading_loop(_: Application) -> None:
                 last_rsi = rsi.iloc[-3]
                 
 
-                if any(pd.isna(x) for x in [curr_sma, prev_sma, curr_rsi, prev_rsi]):
+                if any(pd.isna(x) for x in [curr_hma, prev_sma, curr_rsi, prev_rsi]):
                     continue
 
                 mark_price = get_current_price(symbol)

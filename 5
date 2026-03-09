@@ -504,8 +504,8 @@ async def trading_loop(_: Application) -> None:
                 if mark_price <= 0:
                     continue
 
-                sma_rising  = curr_rsi > last_rsi and last_rsi < prev_rsi
-                sma_falling = curr_rsi < last_rsi and last_rsi > prev_rsi
+                sma_rising  = curr_rsi > last_rsi #and last_rsi < prev_rsi
+                sma_falling = curr_rsi < last_rsi #and last_rsi > prev_rsi
                 rsi_rising  = curr_hma > last_hma and last_hma < prev_hma
                 rsi_falling = curr_hma < last_hma and last_hma > prev_hma
 

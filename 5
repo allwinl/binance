@@ -1,7 +1,9 @@
 # bot.py
 # Binance USDS-M Futures – Telegram controlled bot
-# Fixed:
-#   - Replaced deprecated datetime.utcnow() → datetime.now(timezone.utc)
+# Updated:
+#   - Default: Mainnet (real trading) – USE_TESTNET = False
+#   - Replaced EMA(14) → HMA(15) calculated via WMA
+#   - Fixed: Replaced deprecated datetime.utcnow() → datetime.now(timezone.utc)
 #   - Improved TP cancel: treat "order not found" (-2011/-2013 or 400) as success/silent
 
 import time
@@ -18,7 +20,6 @@ import math
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 
 from telegram import Update, Bot
@@ -48,7 +49,7 @@ API_SECRET = binance_cfg.get("api_secret")
 TELEGRAM_TOKEN = telegram_cfg.get("token")
 TELEGRAM_CHAT_ID = telegram_cfg.get("chat_id")
 
-USE_TESTNET = trading_cfg.get("use_testnet", True)
+USE_TESTNET = trading_cfg.get("use_testnet", False)  # ← changed default to False (real trading)
 
 if USE_TESTNET:
     BASE_URL = "https://testnet.binancefuture.com"
@@ -77,6 +78,34 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────
+# Hull Moving Average (HMA) using WMA
+# ────────────────────────────────────────────────
+
+def wma(series: pd.Series, period: int) -> pd.Series:
+    """Weighted Moving Average"""
+    weights = np.arange(1, period + 1)
+    def weighted_avg(x):
+        return np.dot(x, weights[-len(x):]) / weights[-len(x):].sum()
+    return series.rolling(period).apply(weighted_avg, raw=True)
+
+
+def hma(series: pd.Series, period: int = 15) -> pd.Series:
+    """
+    Hull Moving Average:
+    HMA[n] = WMA( 2×WMA(n/2) − WMA(n) , sqrt(n) )
+    """
+    half = int(period / 2)
+    sqrt_n = int(np.sqrt(period))
+
+    wma_half = wma(series, half)
+    wma_full = wma(series, period)
+
+    raw_hma = 2 * wma_half - wma_full
+    hma_final = wma(raw_hma, sqrt_n)
+
+    return hma_final
 
 # ────────────────────────────────────────────────
 # State
@@ -108,7 +137,7 @@ async def send_telegram(msg: str, silent: bool = True):
         logger.error(f"Telegram send failed: {e}")
 
 # ────────────────────────────────────────────────
-# Binance helpers
+# Binance helpers (unchanged)
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
@@ -294,7 +323,6 @@ def cancel_take_profit(symbol: str) -> bool:
         "orderId": order_id
     })
 
-    # Treat common "already gone" cases as success
     if "orderId" in resp:
         symbol_tp_order_id[symbol] = None
         logger.info(f"TP {order_id} canceled for {symbol}")
@@ -336,7 +364,7 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "15m EMA→RSI→SMA bot\n"
+        "15m HMA→RSI→SMA bot\n"
         "Entry LONG: SMA(5) ↑\n"
         "Entry SHORT: SMA(5) ↓\n"
         "Conditional reversal:\n"
@@ -408,12 +436,12 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 # ────────────────────────────────────────────────
-# Trading loop
+# Trading loop – HMA instead of EMA
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
     logger.info(f"Started – interval {CHECK_INTERVAL_SECONDS}s – cooldown {COOLDOWN_SECONDS}s")
-    await send_telegram("Bot started – conditional reversal active", silent=False)
+    await send_telegram("Bot started – HMA(15) conditional reversal active", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -452,9 +480,11 @@ async def trading_loop(_: Application) -> None:
                 ])
                 df["close"] = df["close"].astype(float)
 
-                ema14 = EMAIndicator(df["close"], window=14).ema_indicator()
-                rsi   = RSIIndicator(ema14, window=14).rsi()
+                # ─── Changed part ────────────────────────────────
+                hma15 = hma(df["close"], period=15)
+                rsi   = RSIIndicator(hma15, window=14).rsi()
                 sma5  = rsi.rolling(5).mean()
+                # ────────────────────────────────────────────────
 
                 if len(sma5.dropna()) < 3:
                     continue

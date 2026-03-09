@@ -3,8 +3,8 @@
 # This is for REAL Binance mainnet (live trading)
 
 binance:
-  api_key:     "9ORkgAY8HXA0w51LUTAHkD9J5C7y4J9hrXX2NUtGuXbWzSePHlTW3daLPpdytvvM"
-  api_secret:  "iDHclDBFyQVjGXVOhnwIFMf2NEsx1wfZVJ0ksM1SAOhgb0RJtgDDXP2grfLMGmQr"
+  api_key:     "8Vk0OOD3G2YqlcUcsl00t8f7Sl87MyTDzOs3cKNlyQzeoiDhLuTFLhidst9QoOb2"
+  api_secret:  "RKy9Ooji40608olqCa7VWwkTbtQyoEzpqL2keyuAmAmTnobURma3eFvxX1olGvjz"
 
 
 telegram:
@@ -13,5 +13,5 @@ telegram:
 
 
 trading:
-  use_testnet: true          # ← change to false for real trading!
+  use_testnet: false          # ← change to false for real trading!
   max_allowed_loss_usdt: -10.0

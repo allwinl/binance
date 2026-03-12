@@ -1,0 +1,618 @@
+# bot.py
+# Binance USDS-M Futures – Telegram controlled bot
+# Updated:
+#   - Default: Mainnet (real trading) – USE_TESTNET = False
+#   - Replaced EMA(14) → HMA(15) calculated via WMA
+#   - Fixed: Replaced deprecated datetime.utcnow() → datetime.now(timezone.utc)
+#   - Improved TP cancel: treat "order not found" (-2011/-2013 or 400) as success/silent
+
+import time
+import logging
+import requests
+import hmac
+import hashlib
+import yaml
+from urllib.parse import urlencode
+from typing import Dict, Set, Optional
+import pandas as pd
+import numpy as np
+import math
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+from ta.momentum import RSIIndicator
+
+from telegram import Update, Bot
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+# ────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────
+
+try:
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f)
+except FileNotFoundError:
+    print("ERROR: config.yaml not found")
+    exit(1)
+
+binance_cfg  = config.get("binance",  {})
+telegram_cfg = config.get("telegram", {})
+trading_cfg  = config.get("trading",  {})
+
+API_KEY    = binance_cfg.get("api_key")
+API_SECRET = binance_cfg.get("api_secret")
+TELEGRAM_TOKEN = telegram_cfg.get("token")
+TELEGRAM_CHAT_ID = telegram_cfg.get("chat_id")
+
+USE_TESTNET = trading_cfg.get("use_testnet", False)  # ← changed default to False (real trading)
+
+if USE_TESTNET:
+    BASE_URL = "https://testnet.binancefuture.com"
+    print("=== TESTNET MODE ===")
+else:
+    BASE_URL = "https://fapi.binance.com"
+    print("=== MAINNET – REAL MONEY ===")
+
+FIXED_LEVERAGE   = 5
+FIXED_MARGIN_TYPE = "ISOLATED"
+CHECK_INTERVAL_SECONDS = 60
+POSITION_TOLERANCE     = 1e-6
+MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -10.0)
+TAKE_PROFIT_PCT        = 0.05
+COOLDOWN_SECONDS       = 30
+
+if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+    print("ERROR: Missing keys/token/chat_id")
+    exit(1)
+
+HEADERS = {"X-MBX-APIKEY": API_KEY}
+
+logging.basicConfig(
+    format='%(asctime)s  %(levelname)-8s  %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────
+# Hull Moving Average (HMA) using WMA
+# ────────────────────────────────────────────────
+
+def wma(series: pd.Series, period: int) -> pd.Series:
+    """Weighted Moving Average"""
+    weights = np.arange(1, period + 1)
+    def weighted_avg(x):
+        return np.dot(x, weights[-len(x):]) / weights[-len(x):].sum()
+    return series.rolling(period).apply(weighted_avg, raw=True)
+
+
+def hma(series: pd.Series, period: int = 15) -> pd.Series:
+    """
+    Hull Moving Average:
+    HMA[n] = WMA( 2×WMA(n/2) − WMA(n) , sqrt(n) )
+    """
+    half = int(period / 2)
+    sqrt_n = int(np.sqrt(period))
+
+    wma_half = wma(series, half)
+    wma_full = wma(series, period)
+
+    raw_hma = 2 * wma_half - wma_full
+    hma_final = wma(raw_hma, sqrt_n)
+
+    return hma_final
+
+# ────────────────────────────────────────────────
+# State
+# ────────────────────────────────────────────────
+
+monitored_symbols: Set[str] = set()
+configured: Set[str] = set()
+symbol_position_state: Dict[str, Optional[str]] = {}
+symbol_entry_price: Dict[str, Optional[float]] = {}
+symbol_tp_order_id: Dict[str, Optional[int]] = {}
+last_action_time: Dict[str, Optional[datetime]] = {}
+
+_price_precision_cache: Dict[str, int] = {}
+
+telegram_bot = Bot(token=TELEGRAM_TOKEN)
+
+# ────────────────────────────────────────────────
+# Telegram notifications
+# ────────────────────────────────────────────────
+
+async def send_telegram(msg: str, silent: bool = True):
+    try:
+        await telegram_bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=msg,
+            disable_notification=silent
+        )
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+
+# ────────────────────────────────────────────────
+# Binance helpers (unchanged)
+# ────────────────────────────────────────────────
+
+def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
+    if params is None: params = {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+    qs = urlencode(sorted(params.items()))
+    sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    url = f"{BASE_URL}{endpoint}?{qs}&signature={sig}"
+    try:
+        if method.upper() == "GET":
+            r = requests.get(url, headers=HEADERS, timeout=10)
+        elif method.upper() == "POST":
+            r = requests.post(url, headers=HEADERS, timeout=10)
+        elif method.upper() == "DELETE":
+            r = requests.delete(url, headers=HEADERS, timeout=10)
+        else:
+            raise ValueError("Bad method")
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and "code" in data and data["code"] < 0:
+            logger.debug(f"API response code {data['code']}: {data.get('msg')}")
+        return data
+    except requests.exceptions.HTTPError as http_err:
+        logger.error(f"HTTP error {endpoint}: {http_err} - response: {r.text if 'r' in locals() else 'no response'}")
+        return {"error": str(http_err)}
+    except Exception as e:
+        logger.error(f"Request failed {endpoint}: {e}")
+        return {"error": str(e)}
+
+def public_get(endpoint: str, params: Dict = None) -> list | dict:
+    if params is None: params = {}
+    try:
+        r = requests.get(f"{BASE_URL}{endpoint}", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Public GET failed {endpoint}: {e}")
+        return []
+
+def symbol_is_valid_perp(symbol: str) -> bool:
+    data = public_get("/fapi/v1/exchangeInfo")
+    if not isinstance(data, dict): return False
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            return (s.get("contractType") == "PERPETUAL" and
+                    s.get("status") == "TRADING" and
+                    s.get("quoteAsset") == "USDT")
+    return False
+
+def get_price_precision(symbol: str) -> int:
+    if symbol in _price_precision_cache:
+        return _price_precision_cache[symbol]
+    data = public_get("/fapi/v1/exchangeInfo")
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = float(f.get("tickSize", "0.0001"))
+                    prec = max(0, -int(math.log10(tick))) if tick > 0 else 4
+                    _price_precision_cache[symbol] = prec
+                    return prec
+    _price_precision_cache[symbol] = 4
+    return 4
+
+def ensure_leverage_and_margin(symbol: str) -> bool:
+    if symbol in configured: return True
+    pos_data = signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    if not isinstance(pos_data, list) or not pos_data: return False
+    pos = pos_data[0]
+    lev_ok = int(pos.get("leverage", 0)) == FIXED_LEVERAGE
+    margin_ok = pos.get("isolated", False) == (FIXED_MARGIN_TYPE == "ISOLATED")
+    success = True
+    if not lev_ok:
+        r = signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": FIXED_LEVERAGE})
+        success &= "code" not in r or r["code"] >= 0
+    if not margin_ok:
+        r = signed_request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": FIXED_MARGIN_TYPE})
+        success &= "code" not in r or r["code"] >= 0
+    if success:
+        configured.add(symbol)
+        logger.info(f"{symbol}: {FIXED_LEVERAGE}x Isolated set")
+    return success
+
+def get_current_position_data(symbol: str) -> dict:
+    data = signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    if isinstance(data, list) and data:
+        pos = data[0]
+        if abs(float(pos.get("positionAmt", "0"))) > POSITION_TOLERANCE:
+            return pos
+    return {}
+
+def sync_position_state(symbol: str) -> None:
+    pos = get_current_position_data(symbol)
+    real_side = None
+    if pos:
+        amt = float(pos.get("positionAmt", "0"))
+        real_side = "LONG" if amt > 0 else "SHORT"
+    current = symbol_position_state.get(symbol)
+    if real_side != current:
+        logger.info(f"Sync {symbol}: {current or 'None'} → {real_side or 'None'}")
+        cancel_take_profit(symbol)
+        symbol_position_state[symbol] = real_side
+        symbol_entry_price[symbol] = None
+        symbol_tp_order_id[symbol] = None
+        last_action_time[symbol] = datetime.now(timezone.utc)
+
+def get_current_price(symbol: str) -> float:
+    data = public_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    return float(data.get("markPrice", 0)) if isinstance(data, dict) else 0.0
+
+def get_klines(symbol: str, interval: str, limit: int = 150) -> list:
+    try:
+        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params={
+            "symbol": symbol, "interval": interval, "limit": limit
+        }, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Klines {symbol} {interval}: {e}")
+        return []
+
+def calculate_safe_quantity(symbol: str) -> float:
+    data = public_get("/fapi/v1/exchangeInfo")
+    min_notional = 5.0
+    step_size = 0.001
+    min_qty = 0.001
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            for f in s.get("filters", []):
+                if f["filterType"] == "LOT_SIZE":
+                    min_qty = float(f["minQty"])
+                    step_size = float(f["stepSize"])
+                if f["filterType"] == "MIN_NOTIONAL":
+                    min_notional = float(f.get("notional", 5.0))
+            break
+    price = get_current_price(symbol)
+    if price <= 0: return 0.0
+    target_usdt = min_notional * 1.1
+    raw_qty = target_usdt / price
+    steps = math.ceil(raw_qty / step_size)
+    qty = max(steps * step_size, min_qty)
+    return round(qty, 6)
+
+def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False) -> dict:
+    if qty <= 0: return {"error": "Invalid qty"}
+    qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
+    params = {
+        "symbol": symbol,
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": qstr,
+    }
+    if reduce_only:
+        params["reduceOnly"] = "true"
+    logger.info(f"ORDER {side.upper()} {qstr} {symbol} reduce={reduce_only}")
+    return signed_request("POST", "/fapi/v1/order", params)
+
+def place_take_profit_order(symbol: str, side: str, qty: float, price: float) -> dict:
+    if price <= 0 or qty <= 0: return {"error": "Invalid TP"}
+    qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
+    prec = get_price_precision(symbol)
+    pstr = f"{price:.{prec}f}".rstrip("0").rstrip(".")
+    params = {
+        "symbol": symbol,
+        "side": "SELL" if side == "LONG" else "BUY",
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": qstr,
+        "price": pstr,
+        "reduceOnly": "true",
+    }
+    logger.info(f"TP {params['side']} {qstr} @ {pstr} {symbol}")
+    return signed_request("POST", "/fapi/v1/order", params)
+
+def cancel_take_profit(symbol: str) -> bool:
+    order_id = symbol_tp_order_id.get(symbol)
+    if not order_id:
+        return True
+
+    resp = signed_request("DELETE", "/fapi/v1/order", {
+        "symbol": symbol,
+        "orderId": order_id
+    })
+
+    if "orderId" in resp:
+        symbol_tp_order_id[symbol] = None
+        logger.info(f"TP {order_id} canceled for {symbol}")
+        return True
+
+    if isinstance(resp, dict):
+        code = resp.get("code")
+        if code in (-2011, -2013) or (code == -1100 and "orderId" in str(resp)):
+            logger.debug(f"TP {order_id} for {symbol} already gone ({resp.get('msg')})")
+            symbol_tp_order_id[symbol] = None
+            return True
+
+    logger.warning(f"TP cancel failed {symbol} order {order_id}: {resp}")
+    return False
+
+def close_position(symbol: str, reason: str = "manual") -> bool:
+    pos = get_current_position_data(symbol)
+    if not pos: return True
+    amt = float(pos.get("positionAmt", "0"))
+    side = "SELL" if amt > 0 else "BUY"
+    qty = abs(amt)
+    resp = place_market_order(symbol, side, qty, reduce_only=True)
+    success = resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED")
+    if success:
+        cancel_take_profit(symbol)
+        symbol_position_state[symbol] = None
+        symbol_entry_price[symbol] = None
+        symbol_tp_order_id[symbol] = None
+        last_action_time[symbol] = datetime.now(timezone.utc)
+        logger.info(f"Closed {symbol} ({reason})")
+        asyncio.create_task(send_telegram(f"Position closed ({reason}): {symbol}"))
+    else:
+        logger.error(f"Close failed {symbol}: {resp}")
+    return success
+
+# ────────────────────────────────────────────────
+# Telegram commands (unchanged)
+# ────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "15m HMA→RSI→SMA bot\n"
+        "Entry LONG: SMA(5) ↑\n"
+        "Entry SHORT: SMA(5) ↓\n"
+        "Conditional reversal:\n"
+        "  LONG + RSI↓ + SMA↓ → close → SHORT\n"
+        "  SHORT + RSI↑ + SMA↑ → close → LONG\n"
+        "Commands: /add /rem /list /reset"
+    )
+    await update.message.reply_text(text)
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /add BTCUSDT")
+        return
+    sym = context.args[0].strip().upper()
+    if not sym.endswith("USDT") or not symbol_is_valid_perp(sym):
+        await update.message.reply_text(f"{sym} invalid or not USDT perpetual")
+        return
+    if sym in monitored_symbols:
+        await update.message.reply_text(f"{sym} already monitored")
+        return
+    if ensure_leverage_and_margin(sym):
+        monitored_symbols.add(sym)
+        symbol_position_state[sym] = None
+        await update.message.reply_text(f"Added {sym}")
+        await send_telegram(f"Added: {sym}")
+    else:
+        await update.message.reply_text(f"Failed to configure {sym}")
+
+async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /rem BTCUSDT")
+        return
+    sym = context.args[0].strip().upper()
+    if sym not in monitored_symbols:
+        await update.message.reply_text(f"{sym} not monitored")
+        return
+    closed = close_position(sym, "manual remove")
+    monitored_symbols.remove(sym)
+    symbol_position_state.pop(sym, None)
+    symbol_entry_price.pop(sym, None)
+    symbol_tp_order_id.pop(sym, None)
+    configured.discard(sym)
+    last_action_time.pop(sym, None)
+    msg = f"Removed {sym}" + (" + closed" if closed else "")
+    await update.message.reply_text(msg)
+    await send_telegram(msg)
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    closed = [sym for sym in list(monitored_symbols) if close_position(sym, "reset")]
+    old = sorted(monitored_symbols)
+    monitored_symbols.clear()
+    symbol_position_state.clear()
+    symbol_entry_price.clear()
+    symbol_tp_order_id.clear()
+    configured.clear()
+    last_action_time.clear()
+    text = "Full reset.\n" + (f"Removed: {', '.join(old)}\n" if old else "") + (f"Closed: {', '.join(closed)}\n" if closed else "")
+    await update.message.reply_text(text)
+    await send_telegram("Bot reset – no symbols monitored")
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not monitored_symbols:
+        await update.message.reply_text("No symbols monitored.")
+        return
+    lines = ["Monitored:"]
+    for sym in sorted(monitored_symbols):
+        side = symbol_position_state.get(sym, "—")
+        lines.append(f"  {sym:10}  {side}")
+    await update.message.reply_text("\n".join(lines))
+
+# ────────────────────────────────────────────────
+# Trading loop – HMA instead of EMA
+# ────────────────────────────────────────────────
+
+async def trading_loop(_: Application) -> None:
+    logger.info(f"Started – interval {CHECK_INTERVAL_SECONDS}s – cooldown {COOLDOWN_SECONDS}s")
+    await send_telegram("Bot started – HMA(15) conditional reversal active", silent=False)
+
+    while True:
+        if not monitored_symbols:
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+            continue
+
+        for symbol in list(monitored_symbols):
+            try:
+                sync_position_state(symbol)
+                current_side = symbol_position_state.get(symbol)
+
+                pos = get_current_position_data(symbol)
+                if not pos and current_side is not None:
+                    symbol_position_state[symbol] = None
+                    symbol_entry_price[symbol] = None
+                    symbol_tp_order_id[symbol] = None
+                    continue
+
+                if pos:
+                    pnl = float(pos.get("unRealizedProfit", 0))
+                    if pnl < MAX_ALLOWED_LOSS_USDT:
+                        close_position(symbol, "max loss cut")
+                        await send_telegram(f"⚠️ LOSS CUT {symbol} PnL {pnl:.2f}")
+                        continue
+
+                qty = calculate_safe_quantity(symbol)
+                if qty < 1e-5:
+                    continue
+
+                klines = get_klines(symbol, "15m", 150)
+                if not klines or len(klines) < 60:
+                    continue
+
+                df = pd.DataFrame(klines, columns=[
+                    "ot","open","high","low","close","vol","ct","qv","n","tbv","tqv","i"
+                ])
+                df["close"] = df["close"].astype(float)
+
+                # ─── Changed part ────────────────────────────────
+                hma15 = hma(df["close"], period=15)
+                rsi   = RSIIndicator(hma15, window=14).rsi()
+                sma5  = rsi.rolling(5).mean()
+                # ────────────────────────────────────────────────
+
+                if len(sma5.dropna()) < 3:
+                    continue
+
+                curr_sma = hma15.iloc[-2]
+                last_sma = hma15.iloc[-3]
+                prev_sma = hma15.iloc[-4]
+                curr_rsi = rsi.iloc[-2]
+                prev_rsi = rsi.iloc[-4]
+                last_rsi = rsi.iloc[-3]
+                
+
+                if any(pd.isna(x) for x in [curr_sma, prev_sma, curr_rsi, prev_rsi]):
+                    continue
+
+                mark_price = get_current_price(symbol)
+                if mark_price <= 0:
+                    continue
+
+                sma_rising  = curr_rsi > last_rsi and last_rsi < prev_rsi
+                sma_falling = curr_rsi < last_rsi and last_rsi > prev_rsi
+                rsi_rising  = curr_sma > last_sma and last_sma < prev_sma
+                rsi_falling = curr_sma < last_sma and last_sma > prev_sma
+
+                can_trade = True
+                if symbol in last_action_time and last_action_time[symbol]:
+                    if datetime.now(timezone.utc) - last_action_time[symbol] < timedelta(seconds=COOLDOWN_SECONDS):
+                        can_trade = False
+
+                if not can_trade:
+                    continue
+
+                if current_side is None:
+                    if sma_rising:
+                        resp = place_market_order(symbol, "BUY", qty)
+                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            symbol_position_state[symbol] = "LONG"
+                            symbol_entry_price[symbol] = mark_price
+                            tp_price = mark_price * (1 + TAKE_PROFIT_PCT)
+                            tp = place_take_profit_order(symbol, "LONG", qty, tp_price)
+                            if "orderId" in tp:
+                                symbol_tp_order_id[symbol] = tp["orderId"]
+                            msg = f"🟢 LONG {symbol} @ {mark_price:.4f} TP {tp_price:.{get_price_precision(symbol)}f}"
+                            logger.info(msg)
+                            await send_telegram(msg, silent=False)
+                            last_action_time[symbol] = datetime.now(timezone.utc)
+
+                    elif sma_falling:
+                        resp = place_market_order(symbol, "SELL", qty)
+                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            symbol_position_state[symbol] = "SHORT"
+                            symbol_entry_price[symbol] = mark_price
+                            tp_price = mark_price * (1 - TAKE_PROFIT_PCT)
+                            tp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
+                            if "orderId" in tp:
+                                symbol_tp_order_id[symbol] = tp["orderId"]
+                            msg = f"🔴 SHORT {symbol} @ {mark_price:.4f} TP {tp_price:.{get_price_precision(symbol)}f}"
+                            logger.info(msg)
+                            await send_telegram(msg, silent=False)
+                            last_action_time[symbol] = datetime.now(timezone.utc)
+
+                elif current_side == "LONG":
+                    if rsi_falling and sma_falling:
+                        logger.info(f"[{symbol}] REVERSAL: LONG → SHORT (RSI↓ + SMA↓)")
+                        close_position(symbol, "reversal to SHORT")
+                        await send_telegram(f"🔄 {symbol} LONG → SHORT (RSI & SMA ↓)")
+                        resp = place_market_order(symbol, "SELL", qty)
+                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            symbol_position_state[symbol] = "SHORT"
+                            symbol_entry_price[symbol] = mark_price
+                            tp_price = mark_price * (1 - TAKE_PROFIT_PCT)
+                            tp = place_take_profit_order(symbol, "SHORT", qty, tp_price)
+                            if "orderId" in tp:
+                                symbol_tp_order_id[symbol] = tp["orderId"]
+                            msg = f"🔴 SHORT {symbol} @ {mark_price:.4f} (reversal)"
+                            await send_telegram(msg, silent=False)
+                            last_action_time[symbol] = datetime.now(timezone.utc)
+
+                    elif rsi_falling:
+                        logger.info(f"[{symbol}] EXIT LONG (RSI ↓)")
+                        close_position(symbol, "RSI falling")
+                        await send_telegram(f"Closed LONG {symbol} – RSI ↓")
+
+                elif current_side == "SHORT":
+                    if rsi_rising and sma_rising:
+                        logger.info(f"[{symbol}] REVERSAL: SHORT → LONG (RSI↑ + SMA↑)")
+                        close_position(symbol, "reversal to LONG")
+                        await send_telegram(f"🔄 {symbol} SHORT → LONG (RSI & SMA ↑)")
+                        resp = place_market_order(symbol, "BUY", qty)
+                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
+                            symbol_position_state[symbol] = "LONG"
+                            symbol_entry_price[symbol] = mark_price
+                            tp_price = mark_price * (1 + TAKE_PROFIT_PCT)
+                            tp = place_take_profit_order(symbol, "LONG", qty, tp_price)
+                            if "orderId" in tp:
+                                symbol_tp_order_id[symbol] = tp["orderId"]
+                            msg = f"🟢 LONG {symbol} @ {mark_price:.4f} (reversal)"
+                            await send_telegram(msg, silent=False)
+                            last_action_time[symbol] = datetime.now(timezone.utc)
+
+                    elif rsi_rising:
+                        logger.info(f"[{symbol}] EXIT SHORT (RSI ↑)")
+                        close_position(symbol, "RSI rising")
+                        await send_telegram(f"Closed SHORT {symbol} – RSI ↑")
+
+            except Exception as e:
+                logger.error(f"[{symbol}] Error: {e}", exc_info=True)
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+# ────────────────────────────────────────────────
+# Startup
+# ────────────────────────────────────────────────
+
+async def on_startup(app: Application) -> None:
+    asyncio.create_task(trading_loop(app))
+    logger.info("Trading loop started")
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("add",    cmd_add))
+    app.add_handler(CommandHandler("rem",    cmd_rem))
+    app.add_handler(CommandHandler("reset",  cmd_reset))
+    app.add_handler(CommandHandler("list",   cmd_list))
+    app.post_init = on_startup
+    print("Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()

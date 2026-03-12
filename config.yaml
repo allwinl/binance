@@ -7,11 +7,13 @@ binance:
   api_secret:  "RKy9Ooji40608olqCa7VWwkTbtQyoEzpqL2keyuAmAmTnobURma3eFvxX1olGvjz"
 
 
-telegram:
-  token: 7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0
-  chat_id: "1385370555"  
-
-
 trading:
   use_testnet: false          # ← change to false for real trading!
   max_allowed_loss_usdt: -10.0
+
+
+telegram:
+  token: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"
+  chat_id: "-5291509752"           # group ID (negative)
+  alert_bot_user_id: 7904776370       # ← ID of your alert bot
+

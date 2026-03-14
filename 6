@@ -1,6 +1,9 @@
-# alert_bot.py
+# bot.py
 # Binance USDS-M Futures – Telegram ALERT scanner (minimal messages)
-# Sends plain "add SYMBOL" or "rem SYMBOL" to the group (no slash)
+# Sends add SYMBOL or rem SYMBOL to a GROUP when any of last 3 × 8h candles meets criteria
+# To send to group/supergroup/channel:
+#   → Put numeric chat_id (starts with -100...) or @username in config.yaml
+#   → Make sure bot is added to group and has send messages permission
 
 import time
 import logging
@@ -10,7 +13,7 @@ from typing import Set, List
 import pandas as pd
 import asyncio
 
-from telegram import Bot
+from telegram import Update, Bot
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,7 +43,13 @@ if not TELEGRAM_TOKEN:
 if not TELEGRAM_CHAT_ID:
     print("ERROR: Missing chat_id in config.yaml")
     print("For groups/supergroups use negative number starting with -100...")
+    print("Example: chat_id: -1001234567890123")
     exit(1)
+
+# Optional: warn if it looks like private chat
+if isinstance(TELEGRAM_CHAT_ID, int) and TELEGRAM_CHAT_ID > 0:
+    print("WARNING: chat_id is positive → this is probably a PRIVATE chat.")
+    print("For groups use negative ID (e.g. -100xxxxxxxxxx)")
 
 BASE_URL = "https://fapi.binance.com"
 CHECK_INTERVAL_SECONDS = 900
@@ -66,13 +75,13 @@ async def send_telegram(msg: str):
         await telegram_bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=msg,
-            disable_notification=True
+            disable_notification=True   # optional: silent alerts
         )
     except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
+        logger.error(f"Telegram send failed (check chat_id & bot permissions): {e}")
 
 # ────────────────────────────────────────────────
-# Binance helpers
+# Binance helpers (unchanged)
 # ────────────────────────────────────────────────
 
 def public_get(endpoint: str, params: dict = None) -> List | dict:
@@ -118,13 +127,14 @@ def get_klines(symbol: str, interval: str = "8h", limit: int = 30) -> List:
 active_symbols: Set[str] = set()
 
 # ────────────────────────────────────────────────
-# Commands (for humans – optional)
+# Commands
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"8h ±{MIN_ABS_CHANGE_PCT}% scanner\n"
-        f"Sending plain 'add SYMBOL' / 'rem SYMBOL' to chat_id: {TELEGRAM_CHAT_ID}"
+        f"Sending alerts to chat_id: {TELEGRAM_CHAT_ID}\n"
+        f"Active if any of last {LOOKBACK_CANDLES} candles meets criteria"
     )
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -155,12 +165,12 @@ def candle_meets_condition(df: pd.DataFrame, idx: int) -> bool:
     return candle["volume"] >= avg_prev * VOLUME_MULTIPLIER
 
 # ────────────────────────────────────────────────
-# Scanner loop – sends plain text without slash
+# Scanner loop
 # ────────────────────────────────────────────────
 
 async def scanner_loop(_: Application) -> None:
     logger.info(f"Scanner started – interval {CHECK_INTERVAL_SECONDS}s")
-    await send_telegram("Scanner started → sending add/rem commands to group")
+    await send_telegram("Scanner started → sending to group")
 
     all_symbols = get_all_usdt_perpetuals()
     logger.info(f"Scanning {len(all_symbols)} pairs")

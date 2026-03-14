@@ -1,6 +1,6 @@
 # trading_bot.py
 # Binance USDS-M Futures – Telegram controlled trading bot
-# Now properly accepts /add /rem from alert bots in the group
+# Accepts plain-text "add SYMBOL" / "rem SYMBOL" from alert bot(s) in group
 
 import time
 import logging
@@ -341,7 +341,7 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Command handlers – normal users (private + group)
+# Command handlers – normal users (slash commands)
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -350,20 +350,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "LONG:  SMA(5) rising\n"
         "SHORT: SMA(5) falling\n"
         "Reversal: opposite + RSI confirmation\n\n"
-        "Commands:\n"
+        "Commands (you can use):\n"
         "  /add SYMBOL     – add symbol\n"
         "  /rem SYMBOL     – remove symbol\n"
-        "  /list           – monitored symbols\n"
-        "  /reset          – clear everything\n"
-        "Also controlled by alert bot via group messages"
+        "  /list           – show monitored symbols\n"
+        "  /reset          – clear everything\n\n"
+        "Alert bot controls via plain text: add SYMBOL / rem SYMBOL"
     )
     await update.message.reply_text(text)
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not monitored_symbols:
-        await update.message.reply_text("No symbols monitored.")
+        await update.message.reply_text("No symbols are being monitored.")
         return
-    lines = ["Monitored:"]
+    lines = ["Monitored symbols:"]
     for sym in sorted(monitored_symbols):
         side = symbol_position_state.get(sym, "—")
         lines.append(f"  {sym:10}  {side}")
@@ -378,7 +378,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol_tp_order_id.clear()
     configured.clear()
     last_action_time.clear()
-    text = "Full reset done.\n"
+    text = "Full reset performed.\n"
     if old:
         text += f"Removed: {', '.join(old)}\n"
     if closed:
@@ -390,16 +390,16 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Shared add/remove logic
 # ────────────────────────────────────────────────
 
-async def try_add_symbol(symbol: str, from_user_id: int, reply_func) -> None:
+async def try_add_symbol(symbol: str, from_user_id: int, reply_func=None) -> None:
     symbol = symbol.strip().upper()
     if not symbol.endswith("USDT") or not symbol_is_valid_perp(symbol):
         if reply_func:
-            await reply_func(f"Invalid: {symbol} (must be USDT perpetual)")
+            await reply_func(f"Invalid symbol: {symbol} (must be USDT perpetual)")
         return
 
     if symbol in monitored_symbols:
         if reply_func:
-            await reply_func(f"{symbol} already monitored")
+            await reply_func(f"{symbol} is already monitored")
         return
 
     if ensure_leverage_and_margin(symbol):
@@ -415,11 +415,11 @@ async def try_add_symbol(symbol: str, from_user_id: int, reply_func) -> None:
         if reply_func:
             await reply_func(f"Failed to configure {symbol}")
 
-async def try_remove_symbol(symbol: str, from_user_id: int, reply_func) -> None:
+async def try_remove_symbol(symbol: str, from_user_id: int, reply_func=None) -> None:
     symbol = symbol.strip().upper()
     if symbol not in monitored_symbols:
         if reply_func:
-            await reply_func(f"{symbol} not monitored")
+            await reply_func(f"{symbol} is not monitored")
         return
 
     closed = close_position(symbol, "remove")
@@ -438,7 +438,7 @@ async def try_remove_symbol(symbol: str, from_user_id: int, reply_func) -> None:
     await send_telegram(f"Removed by {source}: {symbol}")
 
 # ────────────────────────────────────────────────
-# User commands (/add /rem from humans)
+# User slash commands (/add /rem from humans)
 # ────────────────────────────────────────────────
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -462,10 +462,10 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 # ────────────────────────────────────────────────
-# Accept /add /rem from OTHER BOTS in the group
+# Alert bot plain text handler ("add SYMBOL" / "rem SYMBOL")
 # ────────────────────────────────────────────────
 
-async def handle_group_bot_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_alert_bot_plaintext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
@@ -473,40 +473,37 @@ async def handle_group_bot_commands(update: Update, context: ContextTypes.DEFAUL
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
         return
 
-    # Only messages from bots
+    # Only from bots
     if not update.effective_user.is_bot:
         return
 
     # Optional: restrict to known alert bot
     if ALERT_BOT_USER_ID is not None and update.effective_user.id != ALERT_BOT_USER_ID:
-        logger.info(f"Ignored command from unknown bot {update.effective_user.id}")
+        logger.info(f"Ignored message from unknown bot {update.effective_user.id}")
         return
 
     text = update.message.text.strip()
-    if not text.startswith(("/add ", "/rem ")):
-        return
-
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
         return
 
-    cmd = parts[0]
+    action = parts[0].lower()
     symbol = parts[1].strip().upper()
 
-    logger.info(f"Received bot command: {cmd} {symbol} from bot {update.effective_user.id}")
-
-    if cmd == "/add":
-        await try_add_symbol(symbol, update.effective_user.id, None)
-    elif cmd == "/rem":
-        await try_remove_symbol(symbol, update.effective_user.id, None)
+    if action == "add":
+        logger.info(f"Alert bot → ADD {symbol}")
+        await try_add_symbol(symbol, update.effective_user.id)
+    elif action == "rem":
+        logger.info(f"Alert bot → REM {symbol}")
+        await try_remove_symbol(symbol, update.effective_user.id)
 
 # ────────────────────────────────────────────────
-# Trading logic loop
+# Trading loop
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info(f"Trading loop started – checking every {CHECK_INTERVAL_SECONDS}s")
-    await send_telegram("Trading bot started – HMA(15)+RSI(14)+SMA(5)", silent=False)
+    logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s")
+    await send_telegram("Trading bot started – HMA(15) + RSI(14) + SMA(5)", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -669,18 +666,19 @@ async def on_startup(app: Application) -> None:
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # User commands (humans)
+    # Human user slash commands
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("add",    cmd_add))
     app.add_handler(CommandHandler("rem",    cmd_rem))
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(CommandHandler("reset",  cmd_reset))
 
-    # Bot-to-bot commands in group
+    # Alert bot plain text control in group
     app.add_handler(MessageHandler(
         filters.Chat(chat_id=int(TELEGRAM_CHAT_ID)) &
-        filters.Regex(r'^/(add|rem)\s+'),
-        handle_group_bot_commands
+        filters.Regex(r'^(add|rem)\s+') &
+        filters.ALL,  # we already filter bots inside handler
+        handle_alert_bot_plaintext
     ))
 
     app.post_init = on_startup

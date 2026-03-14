@@ -1,19 +1,17 @@
-# config.yaml
-# NEVER commit this file to version control or share it
-# This is for REAL Binance mainnet (live trading)
-
 binance:
   api_key:     "8Vk0OOD3G2YqlcUcsl00t8f7Sl87MyTDzOs3cKNlyQzeoiDhLuTFLhidst9QoOb2"
   api_secret:  "RKy9Ooji40608olqCa7VWwkTbtQyoEzpqL2keyuAmAmTnobURma3eFvxX1olGvjz"
 
-
 trading:
-  use_testnet: false          # ← change to false for real trading!
+  use_testnet: false       
   max_allowed_loss_usdt: -10.0
-
 
 telegram:
   token: "8524530031:AAEThbIoDk1snrWE4gAfIHUX6HU8bpIcI24"
-  chat_id: "-5291509752"           # group ID (negative)
-  alert_bot_user_id: "8524530031"      # ← ID of your alert bot
-
+  chat_id: "-5291509752"         
+  
+scanner:
+  interval_seconds: 900
+  min_abs_change_pct: 10.0
+  volume_multiplier: 2.0
+  lookback_candles: 3

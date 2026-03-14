@@ -53,9 +53,9 @@ if isinstance(TELEGRAM_CHAT_ID, int) and TELEGRAM_CHAT_ID > 0:
 
 BASE_URL = "https://fapi.binance.com"
 CHECK_INTERVAL_SECONDS = 900
-MIN_ABS_CHANGE_PCT     = 10.0
+MIN_ABS_CHANGE_PCT     = 15
 VOLUME_MULTIPLIER      = 2.0
-LOOKBACK_CANDLES       = 3
+LOOKBACK_CANDLES       = 4
 
 logging.basicConfig(
     format='%(asctime)s  %(levelname)-8s  %(message)s',

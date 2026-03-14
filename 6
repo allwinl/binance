@@ -1,6 +1,6 @@
 # bot.py
 # Binance USDS-M Futures – Telegram ALERT scanner (minimal messages)
-# Sends add SYMBOL or rem SYMBOL to a GROUP when any of last 3 × 8h candles meets criteria
+# Sends /add SYMBOL or /rem SYMBOL to a GROUP when any of last 3 × 8h candles meets criteria
 # To send to group/supergroup/channel:
 #   → Put numeric chat_id (starts with -100...) or @username in config.yaml
 #   → Make sure bot is added to group and has send messages permission
@@ -141,7 +141,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not active_symbols:
         await update.message.reply_text("No active symbols")
         return
-    text = "Active:\n" + "\n".join(f"add {s}" for s in sorted(active_symbols))
+    text = "Active:\n" + "\n".join(f"/add {s}" for s in sorted(active_symbols))
     await update.message.reply_text(text)
 
 # ────────────────────────────────────────────────
@@ -201,11 +201,11 @@ async def scanner_loop(_: Application) -> None:
 
             to_add = current_active - active_symbols
             for sym in sorted(to_add):
-                await send_telegram(f"add {sym}")
+                await send_telegram(f"/add {sym}")
 
             to_rem = active_symbols - current_active
             for sym in sorted(to_rem):
-                await send_telegram(f"rem {sym}")
+                await send_telegram(f"/rem {sym}")
 
             active_symbols.clear()
             active_symbols.update(current_active)

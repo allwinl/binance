@@ -13,7 +13,7 @@ trading:
 
 
 telegram:
-  token: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"
+  token: "8524530031:AAEThbIoDk1snrWE4gAfIHUX6HU8bpIcI24"
   chat_id: "-5291509752"           # group ID (negative)
   alert_bot_user_id: "8524530031"      # ← ID of your alert bot
 

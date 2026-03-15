@@ -541,9 +541,9 @@ async def trading_loop(_: Application) -> None:
                 if len(sma5.dropna()) < 3:
                     continue
 
-                curr_sma = sma5.iloc[-2]
-                last_sma = sma5.iloc[-3]
-                prev_sma = sma5.iloc[-4]
+                curr_hma15 = hma15.iloc[-2]
+                last_hma15 = hma15.iloc[-3]
+                prev_hma15 = hma15.iloc[-4]
                 curr_rsi = rsi.iloc[-2]
                 last_rsi = rsi.iloc[-3]
                 prev_rsi = rsi.iloc[-4]
@@ -555,10 +555,10 @@ async def trading_loop(_: Application) -> None:
                 if mark_price <= 0:
                     continue
 
-                sma_rising  = curr_sma > last_sma > prev_sma
-                sma_falling = curr_sma < last_sma < prev_sma
-                rsi_rising  = curr_rsi > last_rsi > prev_rsi
-                rsi_falling = curr_rsi < last_rsi < prev_rsi
+                sma_rising  = curr_rsi > last_rsi and last_rsi < prev_rsi
+                sma_falling = curr_rsi < last_rsi and last_rsi > prev_rsi
+                rsi_rising  = curr_hma15 < last_hma15 and last_hma15 > prev_hma15
+                rsi_falling = curr_hma15 > last_hma15 and last_hma15 < prev_hma15
 
                 can_trade = True
                 if symbol in last_action_time and last_action_time[symbol]:

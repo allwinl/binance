@@ -60,13 +60,13 @@ else:
 
 FIXED_LEVERAGE   = 5
 FIXED_MARGIN_TYPE = "ISOLATED"
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 15
 POSITION_TOLERANCE     = 1e-6
-MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -10.0)
+MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
 # ─────── Trailing Stop Settings ───────
-TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 0.8)          # percent 0.1–5.0
-TRAILING_ACTIVATION_PCT = trading_cfg.get("trailing_activation_offset_pct", 0.0)  # usually 0 = immediate
+TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 0.5)          # percent 0.1–5.0
+TRAILING_ACTIVATION_PCT = trading_cfg.get("trailing_activation_offset_pct", 0.1)  # usually 0 = immediate
 
 if not 0.1 <= TRAILING_CALLBACK_RATE <= 5.0:
     print("ERROR: trailing_callback_rate must be between 0.1 and 5.0")

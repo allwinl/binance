@@ -528,7 +528,7 @@ async def trading_loop(_: Application) -> None:
                 df["close"] = df["close"].astype(float)
 
                 hma15 = hma(df["close"], 15)
-                rsi   = RSIIndicator(hma15, window=14).rsi()
+                rsi   = RSIIndicator(hma15, window=7).rsi()
                 sma5  = rsi.rolling(5).mean()
 
                 if len(sma5.dropna()) < 3:

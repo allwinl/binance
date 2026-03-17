@@ -21,4 +21,5 @@ trading:
 
 telegram:
   token: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"     
-  chat_id: "1385370555"      
+  chat_id: "1385370555"   
+  alert_bot_user_id: "7904776370"

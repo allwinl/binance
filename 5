@@ -60,7 +60,7 @@ POSITION_TOLERANCE     = 1e-6
 MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
 # ─────── Trailing Stop Settings ───────
-TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 0.5)          # percent 0.1–5.0
+TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 0.5)
 
 if not 0.1 <= TRAILING_CALLBACK_RATE <= 5.0:
     print("ERROR: trailing_callback_rate must be between 0.1 and 5.0")
@@ -70,11 +70,7 @@ COOLDOWN_SECONDS       = 15
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing one or more of: API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID")
-    print("Check config.yaml → binance.api_key, binance.api_secret, telegram.token, telegram.chat_id")
     exit(1)
-
-if ALERT_BOT_USER_ID is None:
-    print("WARNING: alert_bot_user_id not set → alert bot /add /rem disabled")
 
 HEADERS = {"X-MBX-APIKEY": API_KEY}
 
@@ -302,11 +298,11 @@ def place_trailing_stop_order(symbol: str, position_side: str, qty: float, entry
         "type": "TRAILING_STOP_MARKET",
         "quantity": qstr,
         "callbackRate": TRAILING_CALLBACK_RATE,
-        # IMPORTANT: NO reduceOnly parameter → avoids -1106 error in hedge mode
+        # activationPrice is optional - omitted = activates immediately from current price
     }
 
-    logger.info(f"TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  positionSide={position_side}")
-    return signed_request("POST", "/fapi/v1/order", params)
+    logger.info(f"ALGO TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  positionSide={position_side}")
+    return signed_request("POST", "/fapi/v1/algoOrder", params)
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
     pos = get_current_position_data(symbol)
@@ -327,12 +323,12 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Command handlers – normal users
+# Command handlers
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Simple momentum + trend bot\n"
+        "Momentum RSI + HMA trend bot\n"
         "LONG entry:  smoothed RSI ↑\n"
         "SHORT entry: smoothed RSI ↓\n"
         "Exit LONG:   HMA ↓\n"
@@ -423,7 +419,7 @@ async def try_remove_symbol(symbol: str, from_user_id: int, reply_func) -> None:
     await send_telegram(f"Removed by {source}: {symbol}")
 
 # ────────────────────────────────────────────────
-# User commands (/add /rem from anyone – private or group)
+# User commands
 # ────────────────────────────────────────────────
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -447,7 +443,7 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 # ────────────────────────────────────────────────
-# Alert bot commands handler (private OR group)
+# Alert bot message handler
 # ────────────────────────────────────────────────
 
 async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -475,9 +471,9 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}%")
+    logger.info(f"Trading loop started – interval {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}%")
     await send_telegram(
-        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}%",
+        f"Bot started • RSI momentum entry • HMA direction exit • Trailing {TRAILING_CALLBACK_RATE}%",
         silent=False
     )
 
@@ -519,14 +515,13 @@ async def trading_loop(_: Application) -> None:
 
                 hma15 = hma(df["close"], 15)
                 rsi   = RSIIndicator(hma15, window=7).rsi()
-                sma5  = rsi.rolling(5).mean()   # this is our "smoothed RSI" used for entry
+                sma5  = rsi.rolling(5).mean()
 
                 if len(sma5.dropna()) < 2:
                     continue
 
-                # Most recent completed candles
-                curr_mom = sma5.iloc[-1]      # current smoothed RSI
-                prev_mom = sma5.iloc[-2]      # previous smoothed RSI
+                curr_mom = sma5.iloc[-1]
+                prev_mom = sma5.iloc[-2]
 
                 curr_hma = hma15.iloc[-1]
                 prev_hma = hma15.iloc[-2]
@@ -544,7 +539,6 @@ async def trading_loop(_: Application) -> None:
                 hma_down      = curr_hma < prev_hma
                 hma_up        = curr_hma > prev_hma
 
-                # Debug logging
                 logger.info(f"[{symbol}] {mark_price:.2f} | "
                            f"HMA {curr_hma:.2f} ({'↑' if hma_up else '↓'}) | "
                            f"sRSI {curr_mom:.2f} ({'↑' if momentum_up else '↓'})")
@@ -568,8 +562,8 @@ async def trading_loop(_: Application) -> None:
                             trail_resp = place_trailing_stop_order(symbol, "LONG", qty, mark_price)
 
                             msg = f"🟢 LONG {symbol} @ {mark_price:.4f}  (trailing {TRAILING_CALLBACK_RATE}%)"
-                            if isinstance(trail_resp, dict) and "orderId" in trail_resp:
-                                msg += f"  order {trail_resp['orderId']}"
+                            if isinstance(trail_resp, dict) and "algoOrderId" in trail_resp:
+                                msg += f"  algo order {trail_resp['algoOrderId']}"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
@@ -582,8 +576,8 @@ async def trading_loop(_: Application) -> None:
                             trail_resp = place_trailing_stop_order(symbol, "SHORT", qty, mark_price)
 
                             msg = f"🔴 SHORT {symbol} @ {mark_price:.4f}  (trailing {TRAILING_CALLBACK_RATE}%)"
-                            if isinstance(trail_resp, dict) and "orderId" in trail_resp:
-                                msg += f"  order {trail_resp['orderId']}"
+                            if isinstance(trail_resp, dict) and "algoOrderId" in trail_resp:
+                                msg += f"  algo order {trail_resp['algoOrderId']}"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)

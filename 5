@@ -61,7 +61,6 @@ MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
 # ─────── Trailing Stop Settings ───────
 TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 0.5)          # percent 0.1–5.0
-TRAILING_ACTIVATION_PCT = trading_cfg.get("trailing_activation_offset_pct", 0.1)  # usually small or 0
 
 if not 0.1 <= TRAILING_CALLBACK_RATE <= 5.0:
     print("ERROR: trailing_callback_rate must be between 0.1 and 5.0")
@@ -302,15 +301,13 @@ def place_trailing_stop_order(symbol: str, position_side: str, qty: float, entry
         "reduceOnly": "true",
     }
 
-    if TRAILING_ACTIVATION_PCT > 0:
-        if position_side == "LONG":
-            act_price = entry_price * (1 + TRAILING_ACTIVATION_PCT / 100)
-        else:
-            act_price = entry_price * (1 - TRAILING_ACTIVATION_PCT / 100)
-        prec = get_price_precision(symbol)
-        params["activationPrice"] = f"{act_price:.{prec}f}".rstrip("0").rstrip(".")
+    # ────────────────────────────────────────────────
+    # IMPORTANT: We NO LONGER set activationPrice
+    # Let Binance default to current mark price → avoids invalid orders
+    # If you really need offset → add it conditionally AFTER testing
+    # ────────────────────────────────────────────────
 
-    logger.info(f"TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%")
+    logger.info(f"TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  (no activationPrice)")
     return signed_request("POST", "/fapi/v1/order", params)
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
@@ -342,7 +339,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "SHORT entry: smoothed RSI ↓\n"
         "Exit LONG:   HMA ↓\n"
         "Exit SHORT:  HMA ↑\n"
-        f"Trailing:    {TRAILING_CALLBACK_RATE}% callback\n\n"
+        f"Trailing:    {TRAILING_CALLBACK_RATE}% callback (immediate activation)\n\n"
         "Commands:\n"
         "  /add SYMBOL     – add symbol\n"
         "  /rem SYMBOL     – remove symbol\n"
@@ -482,7 +479,7 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
 async def trading_loop(_: Application) -> None:
     logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}%")
     await send_telegram(
-        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}%",
+        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}% (immediate)",
         silent=False
     )
 
@@ -549,7 +546,7 @@ async def trading_loop(_: Application) -> None:
                 hma_down      = curr_hma < prev_hma
                 hma_up        = curr_hma > prev_hma
 
-                # Optional: helpful debug logging (comment out when confident)
+                # Debug logging
                 logger.info(f"[{symbol}] {mark_price:.2f} | "
                            f"HMA {curr_hma:.2f} ({'↑' if hma_up else '↓'}) | "
                            f"sRSI {curr_mom:.2f} ({'↑' if momentum_up else '↓'})")

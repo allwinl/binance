@@ -1,8 +1,6 @@
-# config.yaml
-# NEVER commit this file to version control or share it
-# This is for REAL Binance mainnet (live trading)
 
 #binance real:
+#binance:
 #  api_key:     "8Vk0OOD3G2YqlcUcsl00t8f7Sl87MyTDzOs3cKNlyQzeoiDhLuTFLhidst9QoOb2"
 #  api_secret:  "RKy9Ooji40608olqCa7VWwkTbtQyoEzpqL2keyuAmAmTnobURma3eFvxX1olGvjz"
 
@@ -13,7 +11,7 @@ binance:
 
 
 trading:
-  use_testnet: false          # ← change to false for real trading!
+  use_testnet: true          # ← change to false for real trading!
   max_allowed_loss_usdt: -10.0
   trailing_callback_rate: 0.5     # 0.8% trailing (recommended range: 0.3–2.0)
   trailing_activation_offset_pct: 0.1   # 0 = activate immediately

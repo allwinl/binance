@@ -1,8 +1,3 @@
-# bot.py
-# Binance USDS-M Futures – Telegram controlled bot with TRAILING STOP
-# Supports: group + private messages from alert bot for /add /rem
-# Default: Mainnet (real trading) – USE_TESTNET = False
-
 import time
 import logging
 import requests
@@ -66,7 +61,7 @@ MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
 # ─────── Trailing Stop Settings ───────
 TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 0.5)          # percent 0.1–5.0
-TRAILING_ACTIVATION_PCT = trading_cfg.get("trailing_activation_offset_pct", 0.1)  # usually 0 = immediate
+TRAILING_ACTIVATION_PCT = trading_cfg.get("trailing_activation_offset_pct", 0.1)  # usually small or 0
 
 if not 0.1 <= TRAILING_CALLBACK_RATE <= 5.0:
     print("ERROR: trailing_callback_rate must be between 0.1 and 5.0")
@@ -307,7 +302,6 @@ def place_trailing_stop_order(symbol: str, position_side: str, qty: float, entry
         "reduceOnly": "true",
     }
 
-    # Optional activation price offset
     if TRAILING_ACTIVATION_PCT > 0:
         if position_side == "LONG":
             act_price = entry_price * (1 + TRAILING_ACTIVATION_PCT / 100)
@@ -343,16 +337,17 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "15m HMA(15) → RSI(14) → SMA(5) bot with trailing stop\n"
-        "LONG entry:  SMA(5) rising + RSI confirmation\n"
-        "SHORT entry: SMA(5) falling + RSI confirmation\n"
+        "Simple momentum + trend bot\n"
+        "LONG entry:  smoothed RSI ↑\n"
+        "SHORT entry: smoothed RSI ↓\n"
+        "Exit LONG:   HMA ↓\n"
+        "Exit SHORT:  HMA ↑\n"
         f"Trailing:    {TRAILING_CALLBACK_RATE}% callback\n\n"
         "Commands:\n"
         "  /add SYMBOL     – add symbol\n"
         "  /rem SYMBOL     – remove symbol\n"
         "  /list           – show monitored symbols\n"
         "  /reset          – clear everything\n"
-        "Alert bot can also control via /add /rem"
     )
     await update.message.reply_text(text)
 
@@ -481,13 +476,13 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
         await try_remove_symbol(symbol, ALERT_BOT_USER_ID, None)
 
 # ────────────────────────────────────────────────
-# Trading loop
+# Trading loop – YOUR REQUESTED LOGIC
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
     logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}%")
     await send_telegram(
-        f"Bot started – 15m HMA/RSI/SMA strategy  •  Trailing stop: {TRAILING_CALLBACK_RATE}%",
+        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}%",
         silent=False
     )
 
@@ -529,31 +524,35 @@ async def trading_loop(_: Application) -> None:
 
                 hma15 = hma(df["close"], 15)
                 rsi   = RSIIndicator(hma15, window=7).rsi()
-                sma5  = rsi.rolling(5).mean()
+                sma5  = rsi.rolling(5).mean()   # this is our "smoothed RSI" used for entry
 
-                if len(sma5.dropna()) < 3:
+                if len(sma5.dropna()) < 2:
                     continue
 
-                # Use last completed candles (avoid current open bar)
-                curr_hma = hma15.iloc[-2]
-                last_hma = hma15.iloc[-3]
-                prev_hma = hma15.iloc[-4]
+                # Most recent completed candles
+                curr_mom = sma5.iloc[-1]      # current smoothed RSI
+                prev_mom = sma5.iloc[-2]      # previous smoothed RSI
 
-                curr_rsi = rsi.iloc[-2]
-                last_rsi = rsi.iloc[-3]
-                prev_rsi = rsi.iloc[-4]
+                curr_hma = hma15.iloc[-1]
+                prev_hma = hma15.iloc[-2]
 
-                if any(pd.isna(x) for x in [curr_hma, last_hma, prev_hma, curr_rsi, last_rsi, prev_rsi]):
+                if any(pd.isna(x) for x in [curr_mom, prev_mom, curr_hma, prev_hma]):
                     continue
 
                 mark_price = get_current_price(symbol)
                 if mark_price <= 0:
                     continue
 
-                sma_rising  = curr_rsi > last_rsi #and last_rsi < prev_rsi
-                sma_falling = curr_rsi < last_rsi #and last_rsi > prev_rsi
-                rsi_rising  = curr_hma < last_hma
-                rsi_falling = curr_hma > last_hma
+                momentum_up   = curr_mom > prev_mom
+                momentum_down = curr_mom < prev_mom
+
+                hma_down      = curr_hma < prev_hma
+                hma_up        = curr_hma > prev_hma
+
+                # Optional: helpful debug logging (comment out when confident)
+                logger.info(f"[{symbol}] {mark_price:.2f} | "
+                           f"HMA {curr_hma:.2f} ({'↑' if hma_up else '↓'}) | "
+                           f"sRSI {curr_mom:.2f} ({'↑' if momentum_up else '↓'})")
 
                 can_trade = True
                 if symbol in last_action_time and last_action_time[symbol]:
@@ -564,80 +563,48 @@ async def trading_loop(_: Application) -> None:
                 if not can_trade:
                     continue
 
-                # ── No position → Entry ────────────────────────────────
+                # ── No position → Entry ────────────────────────────────────
                 if current_side is None:
-                    if sma_rising and rsi_rising:
+                    if momentum_up:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
                             trail_resp = place_trailing_stop_order(symbol, "LONG", qty, mark_price)
 
-                            msg = (
-                                f"🟢 LONG {symbol} @ {mark_price:.4f}\n"
-                                f"Trailing stop set – {TRAILING_CALLBACK_RATE}% callback"
-                            )
+                            msg = f"🟢 LONG {symbol} @ {mark_price:.4f}  (trailing {TRAILING_CALLBACK_RATE}%)"
                             if "orderId" in trail_resp:
-                                msg += f" (order {trail_resp['orderId']})"
+                                msg += f"  order {trail_resp['orderId']}"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
-                    elif sma_falling and rsi_falling:
+                    elif momentum_down:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
                             trail_resp = place_trailing_stop_order(symbol, "SHORT", qty, mark_price)
 
-                            msg = (
-                                f"🔴 SHORT {symbol} @ {mark_price:.4f}\n"
-                                f"Trailing stop set – {TRAILING_CALLBACK_RATE}% callback"
-                            )
+                            msg = f"🔴 SHORT {symbol} @ {mark_price:.4f}  (trailing {TRAILING_CALLBACK_RATE}%)"
                             if "orderId" in trail_resp:
-                                msg += f" (order {trail_resp['orderId']})"
+                                msg += f"  order {trail_resp['orderId']}"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
-                # ── Existing position ───────────────────────────────────
+                # ── Has position → only check exit condition ───────────────
                 elif current_side == "LONG":
-                    if rsi_falling and sma_falling:
-                        logger.info(f"[{symbol}] REVERSAL LONG → SHORT")
-                        close_position(symbol, "reversal to SHORT")
-                        await send_telegram(f"🔄 {symbol} LONG closed → opening SHORT")
-
-                        resp = place_market_order(symbol, "SELL", qty)
-                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
-                            symbol_position_state[symbol] = "SHORT"
-                            symbol_entry_price[symbol] = mark_price
-                            place_trailing_stop_order(symbol, "SHORT", qty, mark_price)
-                            await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.4f} (reversal + trailing)", silent=False)
-                            last_action_time[symbol] = datetime.now(timezone.utc)
-
-                    elif rsi_falling:
-                        logger.info(f"[{symbol}] EXIT LONG – RSI falling")
-                        close_position(symbol, "RSI falling")
-                        await send_telegram(f"Closed LONG {symbol} – RSI ↓")
+                    if hma_down:
+                        logger.info(f"[{symbol}] HMA ↓ → closing LONG")
+                        close_position(symbol, "HMA down")
+                        await send_telegram(f"Closed LONG {symbol} – HMA ↓")
 
                 elif current_side == "SHORT":
-                    if rsi_rising and sma_rising:
-                        logger.info(f"[{symbol}] REVERSAL SHORT → LONG")
-                        close_position(symbol, "reversal to LONG")
-                        await send_telegram(f"🔄 {symbol} SHORT closed → opening LONG")
-
-                        resp = place_market_order(symbol, "BUY", qty)
-                        if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
-                            symbol_position_state[symbol] = "LONG"
-                            symbol_entry_price[symbol] = mark_price
-                            place_trailing_stop_order(symbol, "LONG", qty, mark_price)
-                            await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.4f} (reversal + trailing)", silent=False)
-                            last_action_time[symbol] = datetime.now(timezone.utc)
-
-                    elif rsi_rising:
-                        logger.info(f"[{symbol}] EXIT SHORT – RSI rising")
-                        close_position(symbol, "RSI rising")
-                        await send_telegram(f"Closed SHORT {symbol} – RSI ↑")
+                    if hma_up:
+                        logger.info(f"[{symbol}] HMA ↑ → closing SHORT")
+                        close_position(symbol, "HMA up")
+                        await send_telegram(f"Closed SHORT {symbol} – HMA ↑")
 
             except Exception as e:
                 logger.error(f"[{symbol}] Error: {e}", exc_info=True)

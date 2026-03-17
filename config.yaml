@@ -8,8 +8,8 @@
 
 
 binance demo:
-  api_key:     "LdBXsskwstk3O39Ol9sAZHlQGoVEgIOJM3vdkQBBj2OiokDwcV8dYLRJsKl6QHRg"
-  api_secret:  "ptV23XbQlq4dpUeCyoq0QOKSqk1Nrka2OuHRNrNbpqqqQC92Rn5RZBbxAFc3wpCm"
+  API_KEY:     "LdBXsskwstk3O39Ol9sAZHlQGoVEgIOJM3vdkQBBj2OiokDwcV8dYLRJsKl6QHRg"
+  API_SECRET:  "ptV23XbQlq4dpUeCyoq0QOKSqk1Nrka2OuHRNrNbpqqqQC92Rn5RZBbxAFc3wpCm"
 
 
 trading:
@@ -20,6 +20,6 @@ trading:
 
 
 telegram:
-  token: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"     
-  chat_id: "1385370555"                                   
+  TELEGRAM_TOKEN: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"     
+  TELEGRAM_CHAT_ID: "1385370555"                                   
                      

@@ -8,18 +8,17 @@
 
 
 binance demo:
-  API_KEY:     "LdBXsskwstk3O39Ol9sAZHlQGoVEgIOJM3vdkQBBj2OiokDwcV8dYLRJsKl6QHRg"
-  API_SECRET:  "ptV23XbQlq4dpUeCyoq0QOKSqk1Nrka2OuHRNrNbpqqqQC92Rn5RZBbxAFc3wpCm"
+  api_key:     "LdBXsskwstk3O39Ol9sAZHlQGoVEgIOJM3vdkQBBj2OiokDwcV8dYLRJsKl6QHRg"
+  api_secret:  "ptV23XbQlq4dpUeCyoq0QOKSqk1Nrka2OuHRNrNbpqqqQC92Rn5RZBbxAFc3wpCm"
 
 
 trading:
-  use_testnet: true          # ← change to false for real trading!
+  use_testnet: false          # ← change to false for real trading!
   max_allowed_loss_usdt: -10.0
   trailing_callback_rate: 0.5     # 0.8% trailing (recommended range: 0.3–2.0)
   trailing_activation_offset_pct: 0.1   # 0 = activate immediately
 
 
 telegram:
-  TELEGRAM_TOKEN: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"     
-  TELEGRAM_CHAT_ID: "1385370555"                                   
-                     
+  token: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"     
+  chat_id: "1385370555"      

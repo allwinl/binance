@@ -157,6 +157,8 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
         return data
     except Exception as e:
         logger.error(f"Request failed {endpoint}: {e}")
+        if 'r' in locals():
+            logger.error(f"Response body: {r.text}")
         return {"error": str(e)}
 
 def public_get(endpoint: str, params: Dict = None) -> list | dict:
@@ -295,19 +297,14 @@ def place_trailing_stop_order(symbol: str, position_side: str, qty: float, entry
     params = {
         "symbol": symbol,
         "side": order_side,
+        "positionSide": position_side.upper(),          # ← FIXED: required in hedge mode
         "type": "TRAILING_STOP_MARKET",
         "quantity": qstr,
         "callbackRate": TRAILING_CALLBACK_RATE,
         "reduceOnly": "true",
     }
 
-    # ────────────────────────────────────────────────
-    # IMPORTANT: We NO LONGER set activationPrice
-    # Let Binance default to current mark price → avoids invalid orders
-    # If you really need offset → add it conditionally AFTER testing
-    # ────────────────────────────────────────────────
-
-    logger.info(f"TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  (no activationPrice)")
+    logger.info(f"TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  positionSide={position_side}")
     return signed_request("POST", "/fapi/v1/order", params)
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
@@ -339,7 +336,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "SHORT entry: smoothed RSI ↓\n"
         "Exit LONG:   HMA ↓\n"
         "Exit SHORT:  HMA ↑\n"
-        f"Trailing:    {TRAILING_CALLBACK_RATE}% callback (immediate activation)\n\n"
+        f"Trailing:    {TRAILING_CALLBACK_RATE}% callback (immediate)\n\n"
         "Commands:\n"
         "  /add SYMBOL     – add symbol\n"
         "  /rem SYMBOL     – remove symbol\n"
@@ -473,7 +470,7 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
         await try_remove_symbol(symbol, ALERT_BOT_USER_ID, None)
 
 # ────────────────────────────────────────────────
-# Trading loop – YOUR REQUESTED LOGIC
+# Trading loop
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:

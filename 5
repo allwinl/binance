@@ -525,9 +525,10 @@ async def trading_loop(_: Application) -> None:
                 prev_mom = sma5.iloc[-2]
 
                 curr_hma = hma15.iloc[-1]
+                last_hma = hma15.iloc[-2]
                 prev_hma = hma15.iloc[-2]
 
-                if any(pd.isna(x) for x in [curr_mom, prev_mom, curr_hma, prev_hma]):
+                if any(pd.isna(x) for x in [curr_mom, prev_mom, curr_hma, prev_hma, last_hma]):
                     continue
 
                 mark_price = get_current_price(symbol)
@@ -537,8 +538,8 @@ async def trading_loop(_: Application) -> None:
                 momentum_up   = curr_mom > prev_mom
                 momentum_down = curr_mom < prev_mom
 
-                hma_down      = curr_hma < prev_hma
-                hma_up        = curr_hma > prev_hma
+                hma_down      = curr_hma < last_hma and last_hma > prev_hma
+                hma_up        = curr_hma > last_hma and last_hma < prev_hma
 
                 logger.info(f"[{symbol}] {mark_price:.2f} | "
                            f"HMA {curr_hma:.2f} ({'↑' if hma_up else '↓'}) | "

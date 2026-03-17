@@ -295,13 +295,14 @@ def place_trailing_stop_order(symbol: str, position_side: str, qty: float, entry
         "symbol": symbol,
         "side": order_side,
         "positionSide": position_side.upper(),
+        "algoType": "CONDITIONAL",                      # ← Mandatory fix for /algoOrder
         "type": "TRAILING_STOP_MARKET",
         "quantity": qstr,
         "callbackRate": TRAILING_CALLBACK_RATE,
-        # activationPrice is optional - omitted = activates immediately from current price
+        # Optional: activationPrice = entry_price * 1.001 or similar for delayed start
     }
 
-    logger.info(f"ALGO TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  positionSide={position_side}")
+    logger.info(f"ALGO TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  positionSide={position_side} algoType=CONDITIONAL")
     return signed_request("POST", "/fapi/v1/algoOrder", params)
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
@@ -323,12 +324,12 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Command handlers
+# Command handlers – normal users
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Momentum RSI + HMA trend bot\n"
+        "Simple momentum + trend bot\n"
         "LONG entry:  smoothed RSI ↑\n"
         "SHORT entry: smoothed RSI ↓\n"
         "Exit LONG:   HMA ↓\n"
@@ -419,7 +420,7 @@ async def try_remove_symbol(symbol: str, from_user_id: int, reply_func) -> None:
     await send_telegram(f"Removed by {source}: {symbol}")
 
 # ────────────────────────────────────────────────
-# User commands
+# User commands (/add /rem from anyone – private or group)
 # ────────────────────────────────────────────────
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -443,7 +444,7 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 # ────────────────────────────────────────────────
-# Alert bot message handler
+# Alert bot commands handler (private OR group)
 # ────────────────────────────────────────────────
 
 async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -471,9 +472,9 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info(f"Trading loop started – interval {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}%")
+    logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}%")
     await send_telegram(
-        f"Bot started • RSI momentum entry • HMA direction exit • Trailing {TRAILING_CALLBACK_RATE}%",
+        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}%",
         silent=False
     )
 

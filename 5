@@ -294,15 +294,12 @@ def place_trailing_stop_order(symbol: str, position_side: str, qty: float, entry
     params = {
         "symbol": symbol,
         "side": order_side,
-        # IMPORTANT: Removed positionSide → compatible with One-way mode (default)
         "algoType": "CONDITIONAL",
         "type": "TRAILING_STOP_MARKET",
         "quantity": qstr,
         "callbackRate": TRAILING_CALLBACK_RATE,
-        "workingType": "MARK_PRICE",           # ← recommended for perps
-        "reduceOnly": "true",                  # ← safety: only closes position
-        # Optional: delay activation until favorable move
-        # "activatePrice": str(entry_price * (1.002 if position_side == "LONG" else 0.998)),
+        "workingType": "MARK_PRICE",
+        "reduceOnly": "true",
     }
 
     logger.info(f"ALGO TRAILING {order_side} {qstr} {symbol}  "
@@ -339,9 +336,9 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Simple momentum + trend bot\n"
-        "LONG entry:  smoothed RSI ↑\n"
-        "SHORT entry: smoothed RSI ↓\n"
+        "Momentum bot – raw RSI slope entry\n"
+        "LONG entry:  RSI(7) ↑\n"
+        "SHORT entry: RSI(7) ↓\n"
         "Exit LONG:   HMA ↓\n"
         "Exit SHORT:  HMA ↑\n"
         f"Trailing:    {TRAILING_CALLBACK_RATE}% callback (MARK_PRICE)\n\n"
@@ -478,13 +475,13 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
         await try_remove_symbol(symbol, ALERT_BOT_USER_ID, None)
 
 # ────────────────────────────────────────────────
-# Trading loop
+# Trading loop – MODIFIED: raw RSI slope instead of smoothed
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
     logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}% MARK_PRICE")
     await send_telegram(
-        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}% (MARK_PRICE)",
+        f"Bot started • Entry: raw RSI(7) slope • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}% (MARK_PRICE)",
         silent=False
     )
 
@@ -515,7 +512,7 @@ async def trading_loop(_: Application) -> None:
                 if qty < 1e-5:
                     continue
 
-                klines = get_klines(symbol, "15m", 150)
+                klines = get_klines(symbol, "1m", 150)
                 if not klines or len(klines) < 60:
                     continue
 
@@ -524,36 +521,37 @@ async def trading_loop(_: Application) -> None:
                 ])
                 df["close"] = df["close"].astype(float)
 
-                hma15 = hma(df["close"], 15)
-                rsi   = RSIIndicator(hma15, window=7).rsi()
-                sma5  = rsi.rolling(5).mean()
+                hma15    = hma(df["close"], 15)
+                rsi      = RSIIndicator(df["close"], window=7).rsi()   # ← raw RSI on close prices
+                # sma5   = rsi.rolling(5).mean()                       # ← REMOVED
 
-                if len(sma5.dropna()) < 2:
+                if len(rsi.dropna()) < 2:
                     continue
 
-                curr_mom = sma5.iloc[-1]
-                prev_mom = sma5.iloc[-2]
+                curr_rsi = rsi.iloc[-2]
+                prev_rsi = rsi.iloc[-3]
+                last_rsi = rsi.iloc[-4]
 
-                curr_hma = hma15.iloc[-1]
-                prev_hma = hma15.iloc[-3] if len(hma15) >= 3 else hma15.iloc[-2]
-                last_hma = hma15.iloc[-2]
+                curr_hma = hma15.iloc[-2]
+                prev_hma = hma15.iloc[-3]
+                last_hma = hma15.iloc[-4]
 
-                if any(pd.isna(x) for x in [curr_mom, prev_mom, curr_hma, prev_hma, last_hma]):
+                if any(pd.isna(x) for x in [curr_rsi, prev_rsi, last_rsi, curr_hma, last_hma, prev_hma]):
                     continue
 
                 mark_price = get_current_price(symbol)
                 if mark_price <= 0:
                     continue
 
-                momentum_up   = curr_mom > prev_mom
-                momentum_down = curr_mom < prev_mom
+                momentum_up   = curr_rsi > prev_rsi
+                momentum_down = curr_rsi < prev_rsi
 
-                hma_down      = curr_hma < last_hma
-                hma_up        = curr_hma > last_hma
+                hma_down      = curr_hma < prev_hma and prev_hma > last_hma
+                hma_up        = curr_hma > prev_hma and prev_hma < last_hma
 
                 logger.info(f"[{symbol}] {mark_price:.4f} | "
                            f"HMA {curr_hma:.4f} ({'↑' if hma_up else '↓'}) | "
-                           f"sRSI {curr_mom:.2f} ({'↑' if momentum_up else '↓'})")
+                           f"RSI(7) {curr_rsi:.2f} ({'↑' if momentum_up else '↓'})")
 
                 can_trade = True
                 if symbol in last_action_time and last_action_time[symbol]:
@@ -564,7 +562,7 @@ async def trading_loop(_: Application) -> None:
                 if not can_trade:
                     continue
 
-                # ── No position → Entry ────────────────────────────────────
+                # ── No position → Entry (now using raw RSI slope) ───────────
                 if current_side is None:
                     if momentum_up:
                         resp = place_market_order(symbol, "BUY", qty)
@@ -598,7 +596,7 @@ async def trading_loop(_: Application) -> None:
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
-                # ── Has position → only check exit condition (before trailing activates) ──
+                # ── Has position → only check exit condition ───────────────
                 elif current_side == "LONG":
                     if hma_down:
                         logger.info(f"[{symbol}] HMA ↓ → closing LONG")

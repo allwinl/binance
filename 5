@@ -294,16 +294,26 @@ def place_trailing_stop_order(symbol: str, position_side: str, qty: float, entry
     params = {
         "symbol": symbol,
         "side": order_side,
-        "positionSide": position_side.upper(),
-        "algoType": "CONDITIONAL",                      # ← Mandatory fix for /algoOrder
+        # IMPORTANT: Removed positionSide → compatible with One-way mode (default)
+        "algoType": "CONDITIONAL",
         "type": "TRAILING_STOP_MARKET",
         "quantity": qstr,
         "callbackRate": TRAILING_CALLBACK_RATE,
-        # Optional: activationPrice = entry_price * 1.001 or similar for delayed start
+        "workingType": "MARK_PRICE",           # ← recommended for perps
+        "reduceOnly": "true",                  # ← safety: only closes position
+        # Optional: delay activation until favorable move
+        # "activatePrice": str(entry_price * (1.002 if position_side == "LONG" else 0.998)),
     }
 
-    logger.info(f"ALGO TRAILING STOP {order_side} {qstr} {symbol}  callback={TRAILING_CALLBACK_RATE}%  positionSide={position_side} algoType=CONDITIONAL")
-    return signed_request("POST", "/fapi/v1/algoOrder", params)
+    logger.info(f"ALGO TRAILING {order_side} {qstr} {symbol}  "
+                f"callback={TRAILING_CALLBACK_RATE}%  working=MARK_PRICE  reduceOnly=true")
+    
+    resp = signed_request("POST", "/fapi/v1/algoOrder", params)
+    
+    if isinstance(resp, dict) and "code" in resp and resp["code"] < 0:
+        logger.error(f"Trailing stop failed for {symbol}: {resp.get('msg')} (code {resp['code']})")
+    
+    return resp
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
     pos = get_current_position_data(symbol)
@@ -334,7 +344,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "SHORT entry: smoothed RSI ↓\n"
         "Exit LONG:   HMA ↓\n"
         "Exit SHORT:  HMA ↑\n"
-        f"Trailing:    {TRAILING_CALLBACK_RATE}% callback\n\n"
+        f"Trailing:    {TRAILING_CALLBACK_RATE}% callback (MARK_PRICE)\n\n"
         "Commands:\n"
         "  /add SYMBOL     – add symbol\n"
         "  /rem SYMBOL     – remove symbol\n"
@@ -472,9 +482,9 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}%")
+    logger.info(f"Trading loop started – check every {CHECK_INTERVAL_SECONDS}s – trailing {TRAILING_CALLBACK_RATE}% MARK_PRICE")
     await send_telegram(
-        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}%",
+        f"Bot started • Entry: RSI momentum • Exit: HMA direction • Trailing: {TRAILING_CALLBACK_RATE}% (MARK_PRICE)",
         silent=False
     )
 
@@ -525,8 +535,8 @@ async def trading_loop(_: Application) -> None:
                 prev_mom = sma5.iloc[-2]
 
                 curr_hma = hma15.iloc[-1]
+                prev_hma = hma15.iloc[-3] if len(hma15) >= 3 else hma15.iloc[-2]
                 last_hma = hma15.iloc[-2]
-                prev_hma = hma15.iloc[-2]
 
                 if any(pd.isna(x) for x in [curr_mom, prev_mom, curr_hma, prev_hma, last_hma]):
                     continue
@@ -538,11 +548,11 @@ async def trading_loop(_: Application) -> None:
                 momentum_up   = curr_mom > prev_mom
                 momentum_down = curr_mom < prev_mom
 
-                hma_down      = curr_hma < last_hma and last_hma > prev_hma
-                hma_up        = curr_hma > last_hma and last_hma < prev_hma
+                hma_down      = curr_hma < last_hma
+                hma_up        = curr_hma > last_hma
 
-                logger.info(f"[{symbol}] {mark_price:.2f} | "
-                           f"HMA {curr_hma:.2f} ({'↑' if hma_up else '↓'}) | "
+                logger.info(f"[{symbol}] {mark_price:.4f} | "
+                           f"HMA {curr_hma:.4f} ({'↑' if hma_up else '↓'}) | "
                            f"sRSI {curr_mom:.2f} ({'↑' if momentum_up else '↓'})")
 
                 can_trade = True
@@ -565,7 +575,9 @@ async def trading_loop(_: Application) -> None:
 
                             msg = f"🟢 LONG {symbol} @ {mark_price:.4f}  (trailing {TRAILING_CALLBACK_RATE}%)"
                             if isinstance(trail_resp, dict) and "algoOrderId" in trail_resp:
-                                msg += f"  algo order {trail_resp['algoOrderId']}"
+                                msg += f"  algoId {trail_resp['algoOrderId']}"
+                            elif "error" in trail_resp or "code" in trail_resp:
+                                msg += f"  [TRAIL FAILED: {trail_resp.get('msg', trail_resp.get('error'))}]"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
@@ -579,12 +591,14 @@ async def trading_loop(_: Application) -> None:
 
                             msg = f"🔴 SHORT {symbol} @ {mark_price:.4f}  (trailing {TRAILING_CALLBACK_RATE}%)"
                             if isinstance(trail_resp, dict) and "algoOrderId" in trail_resp:
-                                msg += f"  algo order {trail_resp['algoOrderId']}"
+                                msg += f"  algoId {trail_resp['algoOrderId']}"
+                            elif "error" in trail_resp or "code" in trail_resp:
+                                msg += f"  [TRAIL FAILED: {trail_resp.get('msg', trail_resp.get('error'))}]"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
-                # ── Has position → only check exit condition ───────────────
+                # ── Has position → only check exit condition (before trailing activates) ──
                 elif current_side == "LONG":
                     if hma_down:
                         logger.info(f"[{symbol}] HMA ↓ → closing LONG")

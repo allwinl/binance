@@ -522,7 +522,7 @@ async def trading_loop(_: Application) -> None:
                 df["close"] = df["close"].astype(float)
 
                 hma15    = hma(df["close"], 15)
-                rsi      = RSIIndicator(df["close"], window=7).rsi()   # ← raw RSI on close prices
+                rsi      = RSIIndicator(df["hma15"], window=7).rsi()   # ← raw RSI on close prices
                 # sma5   = rsi.rolling(5).mean()                       # ← REMOVED
 
                 if len(rsi.dropna()) < 2:
@@ -543,8 +543,8 @@ async def trading_loop(_: Application) -> None:
                 if mark_price <= 0:
                     continue
 
-                momentum_up   = curr_rsi > prev_rsi
-                momentum_down = curr_rsi < prev_rsi
+                momentum_up   = curr_rsi > prev_rsi and  prev_rsi < last_rsi
+                momentum_down = curr_rsi < prev_rsi and  prev_rsi > last_rsi
 
                 hma_down      = curr_hma < prev_hma and prev_hma > last_hma
                 hma_up        = curr_hma > prev_hma and prev_hma < last_hma

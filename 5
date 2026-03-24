@@ -512,7 +512,7 @@ async def trading_loop(_: Application) -> None:
                 if qty < 1e-5:
                     continue
 
-                klines = get_klines(symbol, "1m", 150)
+                klines = get_klines(symbol, "5m", 150)
                 if not klines or len(klines) < 60:
                     continue
 

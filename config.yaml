@@ -18,6 +18,6 @@ trading:
 
 
 telegram:
-  token: "8524530031:AAEThbIoDk1snrWE4gAfIHUX6HU8bpIcI24"    # 8524530031:AAEThbIoDk1snrWE4gAfIHUX6HU8bpIcI24  7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0
+  token: "7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0"    # Alert bot -  8524530031:AAEThbIoDk1snrWE4gAfIHUX6HU8bpIcI24  # Trade bot - 7904776370:AAFB77L9ninv5r0wP_g4vTTkzLYO6-7bdY0
   chat_id: "1385370555"   
-  alert_bot_user_id: "8524530031"
+  alert_bot_user_id: "7904776370"

@@ -54,8 +54,8 @@ if isinstance(TELEGRAM_CHAT_ID, int) and TELEGRAM_CHAT_ID > 0:
 
 BASE_URL = "https://fapi.binance.com"
 CHECK_INTERVAL_SECONDS = 1800       # 30 minutes — daily candles don't need frequent checks
-MIN_ABS_CHANGE_PCT     = 20
-VOLUME_MULTIPLIER      = 1.5
+MIN_ABS_CHANGE_PCT     = 7
+VOLUME_MULTIPLIER      = 1.2
 
 logging.basicConfig(
     format='%(asctime)s  %(levelname)-8s  %(message)s',
@@ -181,7 +181,7 @@ async def scanner_loop(_: Application) -> None:
             current_active = set()
 
             for symbol in all_symbols:
-                klines = get_klines(symbol, interval="1d", limit=60)
+                klines = get_klines(symbol, interval="8h", limit=60)
                 if len(klines) < 20:
                     continue
 

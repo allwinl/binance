@@ -181,7 +181,7 @@ async def scanner_loop(_: Application) -> None:
             current_active = set()
 
             for symbol in all_symbols:
-                klines = get_klines(symbol, interval="8h", limit=60)
+                klines = get_klines(symbol, interval="1d", limit=60)
                 if len(klines) < 20:
                     continue
 

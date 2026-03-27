@@ -54,7 +54,7 @@ if isinstance(TELEGRAM_CHAT_ID, int) and TELEGRAM_CHAT_ID > 0:
 
 BASE_URL = "https://fapi.binance.com"
 CHECK_INTERVAL_SECONDS = 1800       # 30 minutes — daily candles don't need frequent checks
-MIN_ABS_CHANGE_PCT     = 7
+MIN_ABS_CHANGE_PCT     = 15
 VOLUME_MULTIPLIER      = 1.2
 
 logging.basicConfig(

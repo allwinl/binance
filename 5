@@ -563,8 +563,8 @@ async def trading_loop(_: Application) -> None:
                 if mark_price <= 0:
                     continue
 
-                momentum_up   = curr_rsi > prev_rsi # and prev_rsi < last_rsi
-                momentum_down = curr_rsi < prev_rsi # and prev_rsi > last_rsi
+                momentum_up   = curr_rsi > prev_rsi and prev_rsi < last_rsi
+                momentum_down = curr_rsi < prev_rsi and prev_rsi > last_rsi
 
                 hma_down      = curr_hma < prev_hma and prev_hma > last_hma
                 hma_up        = curr_hma > prev_hma and prev_hma < last_hma

@@ -13,8 +13,8 @@ binance:
 trading:
   use_testnet: true          # ← change to false for real trading!
   max_allowed_loss_usdt: -10.0
-  trailing_callback_rate: 2.5
-  trailing_activation_offset_pct: 1.2   # 0.0 = disabled, 0.5~2.0 recommended
+  trailing_callback_rate: 1
+  trailing_activation_offset_pct: 0.8   # 0.0 = disabled, 0.5~2.0 recommended
 
 
 telegram:

@@ -1,7 +1,7 @@
 # bot.py
 # Binance USDS-M Futures – Telegram ALERT scanner (minimal messages)
 # Sends /add SYMBOL or /rem SYMBOL to a GROUP 
-# when any of the last THREE completed daily candles (-2, -3, -4) meets criteria
+# when any of the last TWO completed daily candles (-2, -3) meets criteria
 # To send to group/supergroup/channel:
 #   → Put numeric chat_id (starts with -100...) or @username in config.yaml
 #   → Make sure bot is added to group and has send messages permission
@@ -132,8 +132,8 @@ active_symbols: Set[str] = set()
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"1d ±{MIN_ABS_CHANGE_PCT}% scanner (only checking candles -2, -3, -4)\n"
-        f"Alert when any of these three candles meets criteria\n"
+        f"1d ±{MIN_ABS_CHANGE_PCT}% scanner (only checking candles -2, -3)\n"
+        f"Alert when any of these TWO candles meets criteria\n"
         f"Sending to chat_id: {TELEGRAM_CHAT_ID}"
     )
 
@@ -171,7 +171,7 @@ def candle_meets_condition(df: pd.DataFrame, idx: int) -> bool:
 
 async def scanner_loop(_: Application) -> None:
     logger.info(f"Scanner started – interval {CHECK_INTERVAL_SECONDS}s")
-    await send_telegram("1d scanner started (only checking candles -2/-3/-4) → sending to group")
+    await send_telegram("1d scanner started (only checking candles -2/-3) → sending to group")
 
     all_symbols = get_all_usdt_perpetuals()
     logger.info(f"Scanning {len(all_symbols)} pairs")
@@ -192,10 +192,10 @@ async def scanner_loop(_: Application) -> None:
                 df["close"]  = df["close"].astype(float)
                 df["volume"] = df["volume"].astype(float)
 
-                # Check ONLY candles -2, -3, -4 (three most recent completed days)
+                # Check ONLY candles -2 and -3 (two most recent completed days)
                 meets_any = any(
                     candle_meets_condition(df, -i)
-                    for i in range(2, 5)        # ← changed: only -2, -3, -4
+                    for i in range(2, 4)        # ← changed: only -2, -3
                 )
 
                 if meets_any:
@@ -230,7 +230,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list",  cmd_list))
     app.post_init = on_startup
-    print("Daily (1d) scanner starting – alerts only for candles -2/-3/-4...")
+    print("Daily (1d) scanner starting – alerts only for candles -2/-3...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

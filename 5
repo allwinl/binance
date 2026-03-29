@@ -563,11 +563,12 @@ async def trading_loop(_: Application) -> None:
                 if mark_price <= 0:
                     continue
 
-                momentum_up   = curr_rsi > prev_rsi and prev_rsi < last_rsi
-                momentum_down = curr_rsi < prev_rsi and prev_rsi > last_rsi
+                momentum_up   = curr_rsi > 30 and prev_rsi < 30
+                momentum_down = curr_rsi < 70 and prev_rsi > 70
+                curr_close = df["close"].iloc[-2]
 
-                hma_down      = curr_hma < prev_hma and prev_hma > last_hma
-                hma_up        = curr_hma > prev_hma and prev_hma < last_hma
+                hma_down      = curr_hma > curr_close
+                hma_up        = curr_hma < curr_close
 
                 logger.info(f"[{symbol}] {mark_price:.4f} | "
                            f"HMA {curr_hma:.4f} ({'↑' if hma_up else '↓'}) | "

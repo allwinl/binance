@@ -61,8 +61,8 @@ POSITION_TOLERANCE     = 1e-6
 MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
 # Trailing Stop Settings (kept unchanged as requested)
-TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 1.0)
-TRAILING_ACTIVATION_OFFSET_PCT = trading_cfg.get("trailing_activation_offset_pct", 0.0)
+TRAILING_CALLBACK_RATE = trading_cfg.get("trailing_callback_rate", 0.5)
+TRAILING_ACTIVATION_OFFSET_PCT = trading_cfg.get("trailing_activation_offset_pct", 0.5)
 
 if not 0.1 <= TRAILING_CALLBACK_RATE <= 10.0:
     print("ERROR: trailing_callback_rate must be between 0.1 and 10.0")

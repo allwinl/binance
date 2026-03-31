@@ -12,7 +12,6 @@ import math
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-# MACD Indicator
 from ta.trend import MACD
 
 from telegram import Update, Bot
@@ -60,13 +59,14 @@ CHECK_INTERVAL_SECONDS = 15
 POSITION_TOLERANCE     = 1e-6
 MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
-# Take Profit Settings
-TAKE_PROFIT_PCT = 0.5   # 0.5%
+# Risk Management
+TAKE_PROFIT_PCT = 0.5     # Take Profit at +0.5%
+STOP_LOSS_PCT   = 1.0     # Stop Loss at -1.0%  (change as needed)
 
-COOLDOWN_SECONDS       = 15
+COOLDOWN_SECONDS = 15
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    print("ERROR: Missing one or more of: API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID")
+    print("ERROR: Missing required config values")
     exit(1)
 
 HEADERS = {"X-MBX-APIKEY": API_KEY}
@@ -92,22 +92,14 @@ _price_precision_cache: Dict[str, int] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 
-# ────────────────────────────────────────────────
-# Telegram helpers
-# ────────────────────────────────────────────────
-
 async def send_telegram(msg: str, silent: bool = True):
     try:
-        await telegram_bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=msg,
-            disable_notification=silent
-        )
+        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, disable_notification=silent)
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
 
 # ────────────────────────────────────────────────
-# Binance API helpers
+# Binance API Helpers (unchanged)
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
@@ -129,7 +121,7 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and "code" in data and data["code"] < 0:
-            logger.debug(f"API error {data['code']}: {data.get('msg')}")
+            logger.debug(f"API error {data.get('code')}: {data.get('msg')}")
         return data
     except Exception as e:
         logger.error(f"Request failed {endpoint}: {e}")
@@ -263,41 +255,70 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     logger.info(f"ORDER {side.upper()} {qstr} {symbol} reduce={reduce_only}")
     return signed_request("POST", "/fapi/v1/order", params)
 
-# FIXED: Take Profit using Algo Order API (CONDITIONAL)
-def place_take_profit_order(symbol: str, position_side: str, qty: float, entry_price: float) -> dict:
-    if qty <= 0:
-        return {"error": "Invalid quantity"}
+# ────────────────────────────────────────────────
+# Place Take Profit & Stop Loss using Algo Order API
+# ────────────────────────────────────────────────
+def place_tp_sl_orders(symbol: str, position_side: str, qty: float, entry_price: float):
+    side_tp = "SELL" if position_side == "LONG" else "BUY"
+    side_sl = "SELL" if position_side == "LONG" else "BUY"   # opposite for SL? No: for closing, SL side is same as TP side
+    # Actually for closing the position:
+    # Long  → TP and SL both SELL
+    # Short → TP and SL both BUY
 
-    side = "SELL" if position_side == "LONG" else "BUY"
     price_prec = get_price_precision(symbol)
+    qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
 
+    # Take Profit
     if position_side == "LONG":
         tp_price = entry_price * (1 + TAKE_PROFIT_PCT / 100.0)
     else:
         tp_price = entry_price * (1 - TAKE_PROFIT_PCT / 100.0)
-
     tp_str = f"{tp_price:.{price_prec}f}".rstrip("0").rstrip(".")
-    qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
 
-    params = {
+    tp_params = {
         "symbol": symbol,
-        "side": side,
+        "side": side_tp,
         "type": "TAKE_PROFIT_MARKET",
         "algoType": "CONDITIONAL",
         "quantity": qstr,
         "stopPrice": tp_str,
         "reduceOnly": "true",
         "workingType": "MARK_PRICE",
+        "priceProtect": "FALSE",
     }
 
-    logger.info(f"ALGO TAKE PROFIT {side} {qstr} {symbol} @ {tp_str} ({TAKE_PROFIT_PCT}%)")
+    logger.info(f"ALGO TP {side_tp} {qstr} {symbol} @ {tp_str} ({TAKE_PROFIT_PCT}%)")
+    tp_resp = signed_request("POST", "/fapi/v1/algoOrder", tp_params)
 
-    resp = signed_request("POST", "/fapi/v1/algoOrder", params)
+    if isinstance(tp_resp, dict) and "code" in tp_resp and tp_resp["code"] < 0:
+        logger.error(f"TP failed {symbol}: {tp_resp.get('msg')}")
 
-    if isinstance(resp, dict) and "code" in resp and resp["code"] < 0:
-        logger.error(f"Take Profit failed for {symbol}: {resp.get('msg')} (code {resp['code']})")
+    # Stop Loss
+    if position_side == "LONG":
+        sl_price = entry_price * (1 - STOP_LOSS_PCT / 100.0)
+    else:
+        sl_price = entry_price * (1 + STOP_LOSS_PCT / 100.0)
+    sl_str = f"{sl_price:.{price_prec}f}".rstrip("0").rstrip(".")
 
-    return resp
+    sl_params = {
+        "symbol": symbol,
+        "side": side_tp,   # same side as TP (to close the position)
+        "type": "STOP_MARKET",
+        "algoType": "CONDITIONAL",
+        "quantity": qstr,
+        "stopPrice": sl_str,
+        "reduceOnly": "true",
+        "workingType": "MARK_PRICE",
+        "priceProtect": "FALSE",
+    }
+
+    logger.info(f"ALGO SL {side_tp} {qstr} {symbol} @ {sl_str} (-{STOP_LOSS_PCT}%)")
+    sl_resp = signed_request("POST", "/fapi/v1/algoOrder", sl_params)
+
+    if isinstance(sl_resp, dict) and "code" in sl_resp and sl_resp["code"] < 0:
+        logger.error(f"SL failed {symbol}: {sl_resp.get('msg')}")
+
+    return tp_resp, sl_resp
 
 def close_position(symbol: str, reason: str = "manual") -> bool:
     pos = get_current_position_data(symbol)
@@ -318,19 +339,20 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Command handlers
+# Command handlers (same as before)
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "MACD Momentum Bot\n\n"
+        "MACD Momentum Bot with TP/SL\n\n"
         "Entry:\n"
         "  LONG  → MACD crosses above Signal\n"
         "  SHORT → MACD crosses below Signal\n\n"
         "Exit:\n"
         "  LONG  → MACD Histogram decreasing\n"
         "  SHORT → MACD Histogram increasing\n\n"
-        f"Take Profit: {TAKE_PROFIT_PCT}% fixed (Algo Order)\n\n"
+        f"Take Profit: +{TAKE_PROFIT_PCT}%   |   Stop Loss: -{STOP_LOSS_PCT}%\n"
+        "(both placed as Algo Orders)\n\n"
         "Commands:\n"
         "  /add SYMBOL     – add symbol\n"
         "  /rem SYMBOL     – remove symbol\n"
@@ -339,118 +361,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(text)
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not monitored_symbols:
-        await update.message.reply_text("No symbols are being monitored.")
-        return
-    lines = ["Monitored symbols:"]
-    for sym in sorted(monitored_symbols):
-        side = symbol_position_state.get(sym, "—")
-        lines.append(f"  {sym:10}  {side}")
-    await update.message.reply_text("\n".join(lines))
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    closed = [sym for sym in list(monitored_symbols) if close_position(sym, "reset")]
-    old = sorted(monitored_symbols)
-    monitored_symbols.clear()
-    symbol_position_state.clear()
-    symbol_entry_price.clear()
-    configured.clear()
-    last_action_time.clear()
-    text = "Full reset performed.\n"
-    if old:
-        text += f"Removed: {', '.join(old)}\n"
-    if closed:
-        text += f"Closed: {', '.join(closed)}\n"
-    await update.message.reply_text(text)
-    await send_telegram("Bot reset – no symbols monitored")
-
-async def try_add_symbol(symbol: str, from_user_id: int, reply_func) -> None:
-    symbol = symbol.strip().upper()
-    if not symbol.endswith("USDT") or not symbol_is_valid_perp(symbol):
-        if reply_func:
-            await reply_func(f"Invalid symbol: {symbol} (must be USDT perpetual)")
-        return
-
-    if symbol in monitored_symbols:
-        if reply_func:
-            await reply_func(f"{symbol} is already monitored")
-        return
-
-    if ensure_leverage_and_margin(symbol):
-        monitored_symbols.add(symbol)
-        symbol_position_state[symbol] = None
-        msg = f"Added {symbol}"
-        logger.info(msg)
-        if reply_func:
-            await reply_func(msg)
-        source = "alert bot" if from_user_id == ALERT_BOT_USER_ID else "user"
-        await send_telegram(f"Added by {source}: {symbol}")
-    else:
-        if reply_func:
-            await reply_func(f"Failed to configure {symbol}")
-
-async def try_remove_symbol(symbol: str, from_user_id: int, reply_func) -> None:
-    symbol = symbol.strip().upper()
-    if symbol not in monitored_symbols:
-        if reply_func:
-            await reply_func(f"{symbol} is not monitored")
-        return
-
-    closed = close_position(symbol, "remove")
-    monitored_symbols.remove(symbol)
-    symbol_position_state.pop(symbol, None)
-    symbol_entry_price.pop(symbol, None)
-    configured.discard(symbol)
-    last_action_time.pop(symbol, None)
-
-    msg = f"Removed {symbol}" + (" + closed position" if closed else "")
-    logger.info(msg)
-    if reply_func:
-        await reply_func(msg)
-    source = "alert bot" if from_user_id == ALERT_BOT_USER_ID else "user"
-    await send_telegram(f"Removed by {source}: {symbol}")
-
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /add BTCUSDT")
-        return
-    await try_add_symbol(context.args[0], update.effective_user.id, update.message.reply_text)
-
-async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /rem BTCUSDT")
-        return
-    await try_remove_symbol(context.args[0], update.effective_user.id, update.message.reply_text)
-
-async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != ALERT_BOT_USER_ID:
-        return
-
-    text = update.message.text.strip()
-    if not text.startswith(("/add ", "/rem ")):
-        return
-
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
-        return
-
-    cmd = parts[0]
-    symbol = parts[1].strip().upper()
-
-    if cmd == "/add":
-        await try_add_symbol(symbol, ALERT_BOT_USER_ID, None)
-    elif cmd == "/rem":
-        await try_remove_symbol(symbol, ALERT_BOT_USER_ID, None)
+# cmd_list, cmd_reset, try_add_symbol, try_remove_symbol, cmd_add, cmd_rem, handle_alert_bot_message
+# are unchanged from previous version. Copy them from the last full code I provided.
 
 # ────────────────────────────────────────────────
-# Trading loop – MACD Strategy
+# Trading loop
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info(f"MACD Bot started – TP {TAKE_PROFIT_PCT}% – check every {CHECK_INTERVAL_SECONDS}s")
+    logger.info(f"MACD Bot started – TP +{TAKE_PROFIT_PCT}% | SL -{STOP_LOSS_PCT}%")
     await send_telegram(
-        f"Bot started • MACD Strategy • Take Profit: {TAKE_PROFIT_PCT}% (Algo Order)",
+        f"Bot started • MACD Strategy • TP +{TAKE_PROFIT_PCT}% | SL -{STOP_LOSS_PCT}%",
         silent=False
     )
 
@@ -490,7 +411,6 @@ async def trading_loop(_: Application) -> None:
                 ])
                 df["close"] = df["close"].astype(float)
 
-                # MACD Calculation
                 macd_indicator = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
                 df['macd'] = macd_indicator.macd()
                 df['signal'] = macd_indicator.macd_signal()
@@ -499,7 +419,6 @@ async def trading_loop(_: Application) -> None:
                 if len(df.dropna()) < 5:
                     continue
 
-                # Current values from previous completed candle
                 curr_macd = df['macd'].iloc[-2]
                 prev_macd = df['macd'].iloc[-3]
                 curr_signal = df['signal'].iloc[-2]
@@ -514,12 +433,11 @@ async def trading_loop(_: Application) -> None:
                 if mark_price <= 0:
                     continue
 
-                # Entry signals
                 macd_cross_up   = (prev_macd <= prev_signal) and (curr_macd > curr_signal)
                 macd_cross_down = (prev_macd >= prev_signal) and (curr_macd < curr_signal)
 
-                logger.info(f"[{symbol}] {mark_price:.4f} | "
-                           f"MACD {curr_macd:.4f} Signal {curr_signal:.4f} Hist {curr_hist:.4f}")
+                logger.info(f"[{symbol}] Price {mark_price:.6f} | "
+                           f"MACD {curr_macd:.8f} | Signal {curr_signal:.8f} | Hist {curr_hist:.8f}")
 
                 can_trade = True
                 if symbol in last_action_time and last_action_time[symbol]:
@@ -530,18 +448,15 @@ async def trading_loop(_: Application) -> None:
                 if not can_trade:
                     continue
 
-                # ── No position → Entry ───────────
                 if current_side is None:
                     if macd_cross_up:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
-                            tp_resp = place_take_profit_order(symbol, "LONG", qty, mark_price)
+                            tp_resp, sl_resp = place_tp_sl_orders(symbol, "LONG", qty, mark_price)
 
-                            msg = f"🟢 LONG {symbol} @ {mark_price:.4f}  (TP {TAKE_PROFIT_PCT}%)"
-                            if isinstance(tp_resp, dict) and "algoId" in tp_resp:
-                                msg += f"  algoId {tp_resp.get('algoId')}"
+                            msg = f"🟢 LONG {symbol} @ {mark_price:.6f}  (TP +{TAKE_PROFIT_PCT}% | SL -{STOP_LOSS_PCT}%)"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
@@ -551,24 +466,21 @@ async def trading_loop(_: Application) -> None:
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
-                            tp_resp = place_take_profit_order(symbol, "SHORT", qty, mark_price)
+                            tp_resp, sl_resp = place_tp_sl_orders(symbol, "SHORT", qty, mark_price)
 
-                            msg = f"🔴 SHORT {symbol} @ {mark_price:.4f}  (TP {TAKE_PROFIT_PCT}%)"
-                            if isinstance(tp_resp, dict) and "algoId" in tp_resp:
-                                msg += f"  algoId {tp_resp.get('algoId')}"
+                            msg = f"🔴 SHORT {symbol} @ {mark_price:.6f}  (TP +{TAKE_PROFIT_PCT}% | SL -{STOP_LOSS_PCT}%)"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
-                # ── Has position → Exit on Histogram reversal ───────────────
                 elif current_side == "LONG":
-                    if curr_hist < prev_hist:   # Histogram decreasing
+                    if curr_hist < prev_hist:
                         logger.info(f"[{symbol}] Histogram ↓ → closing LONG")
                         close_position(symbol, "MACD Hist ↓")
                         await send_telegram(f"Closed LONG {symbol} – MACD Histogram decreasing")
 
                 elif current_side == "SHORT":
-                    if curr_hist > prev_hist:   # Histogram increasing
+                    if curr_hist > prev_hist:
                         logger.info(f"[{symbol}] Histogram ↑ → closing SHORT")
                         close_position(symbol, "MACD Hist ↑")
                         await send_telegram(f"Closed SHORT {symbol} – MACD Histogram increasing")
@@ -579,7 +491,7 @@ async def trading_loop(_: Application) -> None:
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # ────────────────────────────────────────────────
-# Startup
+# Startup & main (unchanged)
 # ────────────────────────────────────────────────
 
 async def on_startup(app: Application) -> None:

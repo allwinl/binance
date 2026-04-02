@@ -330,16 +330,16 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Command handlers (unchanged)
+# Command handlers
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Day Open vs 3m Close Strategy Bot\n\n"
-        "Entry Long : 3m close > Previous Day Open\n"
-        "Entry Short: 3m close < Previous Day Open\n"
-        "Exit       : Opposite signal\n"
-        "TP         : Fixed 0.5%\n\n"
+        "SMA(3) Crossover vs Previous Day Open Bot\n\n"
+        "Long  : SMA[-2] > Day Open  AND  SMA[-3] < Day Open\n"
+        "Short : SMA[-2] < Day Open  AND  SMA[-3] > Day Open\n"
+        "Exit  : Opposite crossover\n"
+        "TP    : Fixed 0.5%\n\n"
         "Commands:\n"
         "  /add SYMBOL\n"
         "  /rem SYMBOL\n"
@@ -360,7 +360,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     closed = [sym for sym in list(monitored_symbols) if close_position(sym, "reset")]
-    old = sorted(monitored_symbols)
     monitored_symbols.clear()
     symbol_position_state.clear()
     symbol_entry_price.clear()
@@ -441,12 +440,12 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
         await try_remove_symbol(symbol, ALERT_BOT_USER_ID, None)
 
 # ────────────────────────────────────────────────
-# Trading loop - NEW STRATEGY
+# Trading loop - SMA Crossover Strategy
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started – Day Open vs 3m Close Strategy + 0.5% Fixed TP")
-    await send_telegram("Bot started • Day Open vs 3m Close Strategy + 0.5% Fixed TP", silent=False)
+    logger.info("Trading loop started – SMA(3) Crossover vs Previous Day Open + 0.5% Fixed TP")
+    await send_telegram("Bot started • SMA(3) Crossover vs Prev Day Open + 0.5% Fixed TP", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -474,24 +473,36 @@ async def trading_loop(_: Application) -> None:
                 if qty < 1e-5:
                     continue
 
-                # === NEW STRATEGY: Get 1D open and 3m close ===
+                # === Fetch klines ===
                 klines_1d = get_klines(symbol, "1d", limit=2)
-                klines_3m = get_klines(symbol, "3m", limit=5)
+                klines_3m = get_klines(symbol, "3m", limit=30)   # Enough data for reliable SMA
 
-                if len(klines_1d) < 2 or len(klines_3m) < 2:
+                if len(klines_1d) < 2 or len(klines_3m) < 5:
                     continue
 
-                # Previous day open price ([-2] because [-1] is current incomplete day)
-                day_open = float(klines_1d[-2][1])   # open price of previous completed day
+                # Previous day open price (last completed day)
+                day_open = float(klines_1d[-2][1])
 
-                # Latest 3m candle close
-                three_m_close = float(klines_3m[-1][4])  # close price
+                # Calculate SMA(3) for the last few 3m candles
+                closes = [float(k[4]) for k in klines_3m]  # all closes
+                sma_values = []
+                for i in range(2, len(closes)):
+                    sma = sum(closes[i-2:i+1]) / 3
+                    sma_values.append(sma)
+
+                if len(sma_values) < 3:
+                    continue
+
+                # Get recent SMA values
+                sma_current = sma_values[-1]   # sma[-1]  (most recent)
+                sma_prev     = sma_values[-2]  # sma[-2]
+                sma_prev2    = sma_values[-3]  # sma[-3]
 
                 mark_price = get_current_price(symbol)
                 if mark_price <= 0:
                     continue
 
-                logger.info(f"[{symbol}] 3m Close: {three_m_close:.4f} | Prev Day Open: {day_open:.4f} | Mark: {mark_price:.4f}")
+                logger.info(f"[{symbol}] Day Open: {day_open:.4f} | SMA[-3]: {sma_prev2:.4f} | SMA[-2]: {sma_prev:.4f} | SMA[-1]: {sma_current:.4f}")
 
                 can_trade = True
                 if symbol in last_action_time and last_action_time[symbol]:
@@ -502,10 +513,10 @@ async def trading_loop(_: Application) -> None:
                 if not can_trade:
                     continue
 
-                # Entry Logic
+                # ==================== ENTRY LOGIC ====================
                 if current_side is None:
-                    if three_m_close > day_open:
-                        # LONG
+                    # Long: SMA crosses above day open
+                    if sma_prev > day_open and sma_prev2 < day_open:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "LONG"
@@ -515,13 +526,13 @@ async def trading_loop(_: Application) -> None:
                             tp_price = mark_price * (1 + TAKE_PROFIT_PCT / 100.0)
                             tp_str = f"{tp_price:.{get_price_precision(symbol)}f}".rstrip("0").rstrip(".")
 
-                            msg = f"🟢 LONG {symbol} @ {mark_price:.5f} (TP {tp_str}) | Signal: 3m > 1D Open"
+                            msg = f"🟢 LONG {symbol} @ {mark_price:.2f} (TP {tp_str}) | SMA Crossover Up"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
-                    elif three_m_close < day_open:
-                        # SHORT
+                    # Short: SMA crosses below day open
+                    elif sma_prev < day_open and sma_prev2 > day_open:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "SHORT"
@@ -531,21 +542,21 @@ async def trading_loop(_: Application) -> None:
                             tp_price = mark_price * (1 - TAKE_PROFIT_PCT / 100.0)
                             tp_str = f"{tp_price:.{get_price_precision(symbol)}f}".rstrip("0").rstrip(".")
 
-                            msg = f"🔴 SHORT {symbol} @ {mark_price:.5f} (TP {tp_str}) | Signal: 3m < 1D Open"
+                            msg = f"🔴 SHORT {symbol} @ {mark_price:.2f} (TP {tp_str}) | SMA Crossover Down"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
-                # Exit on opposite signal
+                # ==================== EXIT LOGIC (Opposite Crossover) ====================
                 elif current_side == "LONG":
-                    if three_m_close < day_open:
-                        logger.info(f"[{symbol}] Opposite signal (3m < 1D) → closing LONG")
-                        close_position(symbol, "opposite signal")
+                    if sma_prev < day_open and sma_prev2 > day_open:
+                        logger.info(f"[{symbol}] Opposite SMA crossover down → closing LONG")
+                        close_position(symbol, "opposite crossover")
 
                 elif current_side == "SHORT":
-                    if three_m_close > day_open:
-                        logger.info(f"[{symbol}] Opposite signal (3m > 1D) → closing SHORT")
-                        close_position(symbol, "opposite signal")
+                    if sma_prev > day_open and sma_prev2 < day_open:
+                        logger.info(f"[{symbol}] Opposite SMA crossover up → closing SHORT")
+                        close_position(symbol, "opposite crossover")
 
             except Exception as e:
                 logger.error(f"[{symbol}] Error: {e}", exc_info=True)

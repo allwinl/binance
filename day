@@ -57,7 +57,7 @@ POSITION_TOLERANCE     = 1e-6
 MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
 # Fixed Take Profit
-TAKE_PROFIT_PCT = 0.5   # 0.5%
+TAKE_PROFIT_PCT = 20   # 20%
 
 COOLDOWN_SECONDS = 15
 
@@ -339,7 +339,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Long  : SMA[-2] > Day Open  AND  SMA[-3] < Day Open\n"
         "Short : SMA[-2] < Day Open  AND  SMA[-3] > Day Open\n"
         "Exit  : Opposite crossover\n"
-        "TP    : Fixed 0.5%\n\n"
+        "TP    : Fixed 20%\n\n"
         "Commands:\n"
         "  /add SYMBOL\n"
         "  /rem SYMBOL\n"
@@ -444,8 +444,8 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started – SMA(3) Crossover vs Previous Day Open + 0.5% Fixed TP")
-    await send_telegram("Bot started • SMA(3) Crossover vs Prev Day Open + 0.5% Fixed TP", silent=False)
+    logger.info("Trading loop started – SMA(3) Crossover vs Previous Day Open + 20% Fixed TP")
+    await send_telegram("Bot started • SMA(3) Crossover vs Prev Day Open + 20% Fixed TP", silent=False)
 
     while True:
         if not monitored_symbols:

@@ -516,7 +516,7 @@ async def trading_loop(_: Application) -> None:
                 # ==================== ENTRY LOGIC ====================
                 if current_side is None:
                     # Long: SMA crosses above day open
-                    if sma_prev > day_open and sma_prev2 < day_open:
+                    if sma_prev > day_open: # and sma_prev2 < day_open:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "LONG"
@@ -532,7 +532,7 @@ async def trading_loop(_: Application) -> None:
                             last_action_time[symbol] = datetime.now(timezone.utc)
 
                     # Short: SMA crosses below day open
-                    elif sma_prev < day_open and sma_prev2 > day_open:
+                    elif sma_prev < day_open: # and sma_prev2 > day_open:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "SHORT"

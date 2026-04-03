@@ -89,7 +89,7 @@ def is_alert_time() -> bool:
     minute = now.minute
 
     # Only 23:45 to 23:59 UTC
-    if hour == 23 and minute >= 45:
+    if hour == 14 and minute >= 32:
         return True
 
     return False

@@ -1,0 +1,273 @@
+# bot.py
+# Binance USDS-M Futures – Telegram ALERT scanner (minimal messages)
+# Only sends /add SYMBOL or /rem SYMBOL between 23:45 and 23:59 UTC
+# Checks only the last TWO completed daily candles (-1, -2)
+
+import time
+import logging
+import requests
+import yaml
+from typing import Set, List
+import pandas as pd
+import asyncio
+from datetime import datetime, timezone
+
+from telegram import Update, Bot
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+# ────────────────────────────────────────────────
+# Config
+# ────────────────────────────────────────────────
+
+try:
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f)
+except FileNotFoundError:
+    print("ERROR: config.yaml not found")
+    exit(1)
+
+telegram_cfg = config.get("telegram", {})
+
+TELEGRAM_TOKEN   = telegram_cfg.get("token")
+TELEGRAM_CHAT_ID = telegram_cfg.get("chat_id")
+
+if not TELEGRAM_TOKEN:
+    print("ERROR: Missing telegram token")
+    exit(1)
+
+if not TELEGRAM_CHAT_ID:
+    print("ERROR: Missing chat_id in config.yaml")
+    print("For groups/supergroups use negative number starting with -100...")
+    print("Example: chat_id: -1001234567890123")
+    exit(1)
+
+if isinstance(TELEGRAM_CHAT_ID, int) and TELEGRAM_CHAT_ID > 0:
+    print("WARNING: chat_id is positive → this is probably a PRIVATE chat.")
+    print("For groups use negative ID (e.g. -100xxxxxxxxxx)")
+
+BASE_URL = "https://fapi.binance.com"
+CHECK_INTERVAL_SECONDS = 300        # Check every 5 minutes
+
+MIN_ABS_CHANGE_PCT     = 20
+VOLUME_MULTIPLIER      = 2
+
+logging.basicConfig(
+    format='%(asctime)s  %(levelname)-8s  %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────
+# Telegram sender
+# ────────────────────────────────────────────────
+
+telegram_bot = Bot(token=TELEGRAM_TOKEN)
+
+async def send_telegram(msg: str):
+    try:
+        await telegram_bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=msg,
+            disable_notification=True
+        )
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+
+# ────────────────────────────────────────────────
+# Time restriction: only send alerts between 23:45 and 23:59 UTC
+# ────────────────────────────────────────────────
+
+def is_alert_time() -> bool:
+    """Return True only between 23:45 and 23:59 UTC"""
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    minute = now.minute
+
+    # Only 23:45 to 23:59 UTC
+    if hour == 23 and minute >= 45:
+        return True
+
+    return False
+
+# ────────────────────────────────────────────────
+# Binance helpers
+# ────────────────────────────────────────────────
+
+def public_get(endpoint: str, params: dict = None) -> List | dict:
+    if params is None:
+        params = {}
+    try:
+        r = requests.get(f"{BASE_URL}{endpoint}", params=params, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Public GET failed {endpoint}: {e}")
+        return []
+
+def get_all_usdt_perpetuals() -> List[str]:
+    data = public_get("/fapi/v1/exchangeInfo")
+    if not isinstance(data, dict):
+        return []
+    symbols = []
+    for s in data.get("symbols", []):
+        if (s.get("contractType") == "PERPETUAL" and
+            s.get("status") == "TRADING" and
+            s.get("quoteAsset") == "USDT" and
+            s["symbol"].endswith("USDT")):
+            symbols.append(s["symbol"])
+    return sorted(symbols)
+
+def get_klines(symbol: str, interval: str = "1d", limit: int = 60) -> List:
+    try:
+        r = requests.get(f"{BASE_URL}/fapi/v1/klines", params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+# ────────────────────────────────────────────────
+# State
+# ────────────────────────────────────────────────
+
+active_symbols: Set[str] = set()
+
+# ────────────────────────────────────────────────
+# Commands
+# ────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"1d ±{MIN_ABS_CHANGE_PCT}% scanner\n"
+        f"Checking only candles -1 and -2\n"
+        f"Alerts sent only between 23:45–23:59 UTC\n"
+        f"Sending to chat_id: {TELEGRAM_CHAT_ID}"
+    )
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not active_symbols:
+        await update.message.reply_text("No active symbols")
+        return
+    text = "Active:\n" + "\n".join(f"/add {s}" for s in sorted(active_symbols))
+    await update.message.reply_text(text)
+
+# ────────────────────────────────────────────────
+# Condition check
+# ────────────────────────────────────────────────
+
+def candle_meets_condition(df: pd.DataFrame, idx: int) -> bool:
+    if idx >= 0 or abs(idx) > len(df):
+        return False
+
+    candle = df.iloc[idx]
+    pct = (candle["close"] - candle["open"]) / candle["open"] * 100
+
+    if abs(pct) < MIN_ABS_CHANGE_PCT:
+        return False
+
+    # Volume comparison: average of previous 10 candles before this one
+    start_prev = max(idx - 10, -len(df))
+    prev_vol = df["volume"].iloc[start_prev:idx]
+    if len(prev_vol) < 3:
+        return False
+
+    avg_prev = prev_vol.mean()
+    return candle["volume"] >= avg_prev * VOLUME_MULTIPLIER
+
+# ────────────────────────────────────────────────
+# Scanner loop
+# ────────────────────────────────────────────────
+
+async def scanner_loop(_: Application) -> None:
+    logger.info("Scanner started – checking candles -1 and -2 only")
+    await send_telegram("1d scanner started (candles -1/-2 | alerts 23:45–23:59 UTC)")
+
+    all_symbols = get_all_usdt_perpetuals()
+    logger.info(f"Scanning {len(all_symbols)} USDT perpetual pairs")
+
+    last_alert_day = None
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            current_day = now_utc.date()
+
+            # Only run the full scan and send alerts once per day in the allowed time window
+            if is_alert_time() and last_alert_day != current_day:
+                logger.info(f"Alert window open – scanning all symbols at {now_utc.strftime('%H:%M:%S UTC')}")
+
+                current_active = set()
+
+                for symbol in all_symbols:
+                    klines = get_klines(symbol, interval="1d", limit=60)
+                    if len(klines) < 20:
+                        continue
+
+                    df = pd.DataFrame(klines, columns=[
+                        "ot","open","high","low","close","volume","ct","qv","n","tbv","tqv","i"
+                    ])
+                    df["open"]   = df["open"].astype(float)
+                    df["close"]  = df["close"].astype(float)
+                    df["volume"] = df["volume"].astype(float)
+
+                    # Check ONLY candles -1 and -2
+                    meets_any = any(
+                        candle_meets_condition(df, -i)
+                        for i in [1, 2]        # candles -1 and -2
+                    )
+
+                    if meets_any:
+                        current_active.add(symbol)
+
+                # Send adds
+                to_add = current_active - active_symbols
+                for sym in sorted(to_add):
+                    await send_telegram(f"/add {sym}")
+
+                # Send removals
+                to_rem = active_symbols - current_active
+                for sym in sorted(to_rem):
+                    await send_telegram(f"/rem {sym}")
+
+                # Update state
+                active_symbols.clear()
+                active_symbols.update(current_active)
+
+                last_alert_day = current_day
+                logger.info(f"Daily scan completed. Active symbols: {len(current_active)}")
+
+            else:
+                if last_alert_day == current_day:
+                    await asyncio.sleep(300)  # sleep longer once processed today
+
+        except Exception as e:
+            logger.error(f"Scanner error: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+# ────────────────────────────────────────────────
+# Startup
+# ────────────────────────────────────────────────
+
+async def on_startup(app: Application) -> None:
+    asyncio.create_task(scanner_loop(app))
+    logger.info("Scanner task started")
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("list",  cmd_list))
+    app.post_init = on_startup
+    print("Daily scanner starting – alerts only 23:45–23:59 UTC | checking candles -1/-2")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()

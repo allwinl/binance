@@ -78,10 +78,13 @@ monitored_symbols: Set[str] = set()
 configured: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}
 symbol_entry_price: Dict[str, Optional[float]] = {}
+symbol_last_entry_time: Dict[str, float] = {}   # Cooldown tracking
 
 _price_precision_cache: Dict[str, int] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
+
+COOLDOWN_SECONDS = 30  # Cooldown after opening a position
 
 # ────────────────────────────────────────────────
 # Telegram helpers
@@ -98,7 +101,7 @@ async def send_telegram(msg: str, silent: bool = True):
         logger.error(f"Telegram send failed: {e}")
 
 # ────────────────────────────────────────────────
-# Binance API helpers
+# Binance API helpers (unchanged)
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
@@ -291,6 +294,8 @@ def cancel_all_orders(symbol: str) -> bool:
 def close_position(symbol: str, reason: str = "manual") -> bool:
     pos = get_current_position_data(symbol)
     if not pos or abs(float(pos.get("positionAmt", "0"))) < POSITION_TOLERANCE:
+        symbol_position_state[symbol] = None
+        symbol_entry_price[symbol] = None
         return True
 
     cancel_all_orders(symbol)
@@ -304,7 +309,7 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     if success:
         direction = "LONG" if amt > 0 else "SHORT"
         logger.info(f"Closed {direction} {symbol} ({reason})")
-        symbol_position_state[symbol] = None
+        symbol_position_state[symbol] = None          # ← Important
         symbol_entry_price[symbol] = None
         asyncio.create_task(send_telegram(f"Closed {direction} {symbol} → {reason}"))
     else:
@@ -313,13 +318,12 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Command handlers
+# Command handlers (unchanged)
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "SMA(3) Crossover Bot\n\n"
-        "No cooldown applied.\n\n"
         "Commands:\n"
         "/add SYMBOL\n"
         "/rem SYMBOL\n"
@@ -343,6 +347,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     monitored_symbols.clear()
     symbol_position_state.clear()
     symbol_entry_price.clear()
+    symbol_last_entry_time.clear()
     configured.clear()
     text = "Full reset performed."
     if closed:
@@ -364,6 +369,7 @@ async def try_add_symbol(symbol: str, from_user_id: int, reply_func) -> None:
     if ensure_leverage_and_margin(symbol):
         monitored_symbols.add(symbol)
         symbol_position_state[symbol] = None
+        symbol_last_entry_time[symbol] = 0
         logger.info(f"Added {symbol}")
         if reply_func:
             await reply_func(f"Added {symbol}")
@@ -381,6 +387,7 @@ async def try_remove_symbol(symbol: str, from_user_id: int, reply_func) -> None:
     monitored_symbols.remove(symbol)
     symbol_position_state.pop(symbol, None)
     symbol_entry_price.pop(symbol, None)
+    symbol_last_entry_time.pop(symbol, None)
     configured.discard(symbol)
     logger.info(f"Removed {symbol}")
     if reply_func:
@@ -419,8 +426,8 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started – SMA(3) Crossover vs Prev Day Open + 20% TP (No Cooldown)")
-    await send_telegram("Bot started • SMA(3) Crossover Strategy • No Cooldown", silent=False)
+    logger.info("Trading loop started – SMA(3) Crossover vs Prev Day Open + 20% TP")
+    await send_telegram("Bot started • SMA(3) Crossover Strategy • 30s Cooldown after entry", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -434,6 +441,7 @@ async def trading_loop(_: Application) -> None:
                 current_side = symbol_position_state.get(symbol)
                 mark_price = get_current_price(symbol)
 
+                # Check max loss
                 pos = get_current_position_data(symbol)
                 if pos:
                     pnl = float(pos.get("unRealizedProfit", 0))
@@ -456,7 +464,6 @@ async def trading_loop(_: Application) -> None:
                     continue
 
                 day_open = float(klines_1d[-2][1])
-
                 closes = [float(k[4]) for k in klines_3m]
                 sma_values = [sum(closes[i-2:i+1]) / 3 for i in range(2, len(closes))]
 
@@ -465,49 +472,56 @@ async def trading_loop(_: Application) -> None:
 
                 sma_current = sma_values[-1]
                 sma_prev     = sma_values[-2]
-                sma_prev2    = sma_values[-3]
 
                 logger.info(f"[{symbol}] Price={mark_price:.4f} | DayOpen={day_open:.4f} | "
-                           f"SMA[-3]={sma_prev2:.4f} | SMA[-2]={sma_prev:.4f} | SMA[-1]={sma_current:.4f} | "
+                           f"SMA[-2]={sma_prev:.4f} | SMA[-1]={sma_current:.4f} | "
                            f"Position={current_side or 'None'}")
+
+                current_time = time.time()
 
                 # ==================== ENTRY LOGIC ====================
                 if current_side is None:
+                    # Check cooldown
+                    last_entry = symbol_last_entry_time.get(symbol, 0)
+                    if current_time - last_entry < COOLDOWN_SECONDS:
+                        logger.info(f"[{symbol}] In cooldown ({int(current_time - last_entry)}s left)")
+                        continue
+
                     logger.info(f"[{symbol}] Checking ENTRY conditions...")
 
-                    # LONG Entry
                     if sma_prev > day_open:
                         logger.info(f"[{symbol}] LONG condition met → Placing BUY order")
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
+                            symbol_last_entry_time[symbol] = current_time   # ← Start cooldown
                             place_take_profit_order(symbol, "LONG", qty, mark_price)
-                            msg = f"🟢 LONG {symbol} @ {mark_price:.2f} (TP {TAKE_PROFIT_PCT}%) | SMA Cross Up"
+                            msg = f"🟢 LONG {symbol} @ {mark_price:.2f} (TP {TAKE_PROFIT_PCT}%)"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
 
-                    # SHORT Entry - Separate if (not elif!)
-                    if sma_prev < day_open:
+                    elif sma_prev < day_open:   # ← Changed to elif
                         logger.info(f"[{symbol}] SHORT condition met → Placing SELL order")
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
+                            symbol_last_entry_time[symbol] = current_time   # ← Start cooldown
                             place_take_profit_order(symbol, "SHORT", qty, mark_price)
-                            msg = f"🔴 SHORT {symbol} @ {mark_price:.2f} (TP {TAKE_PROFIT_PCT}%) | SMA Cross Down"
+                            msg = f"🔴 SHORT {symbol} @ {mark_price:.2f} (TP {TAKE_PROFIT_PCT}%)"
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
 
                 # ==================== EXIT LOGIC ====================
                 elif current_side == "LONG":
                     if sma_prev < day_open:
-                        logger.info(f"[{symbol}] LONG exit condition met (SMA below day open)")
+                        logger.info(f"[{symbol}] LONG exit condition met")
                         close_position(symbol, "opposite SMA signal")
 
                 elif current_side == "SHORT":
                     if sma_prev > day_open:
-                        logger.info(f"[{symbol}] SHORT exit condition met (SMA above day open)")
+                        logger.info(f"[{symbol}] SHORT exit condition met")
                         close_position(symbol, "opposite SMA signal")
 
             except Exception as e:

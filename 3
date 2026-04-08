@@ -379,7 +379,7 @@ async def auto_symbol_selection_task():
     while True:
         now = datetime.now(timezone.utc)
         h, m = now.hour, now.minute
-        should_scan = (h == 16 and m >= 40) or (h == 7 and m >= 45) or (h == 15 and m >= 45)
+        should_scan = (h == 23 and m >= 45) or (h == 7 and m >= 45) or (h == 15 and m >= 45)
 
         if should_scan:
             logger.info(f"Volatility scan at {now.strftime('%H:%M UTC')}")

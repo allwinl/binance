@@ -379,7 +379,7 @@ async def auto_symbol_selection_task():
     while True:
         now = datetime.now(timezone.utc)
         h, m = now.hour, now.minute
-        should_scan = (h == 23 and m >= 45) or (h == 7 and m >= 45) or (h == 15 and m >= 45)
+        should_scan = (h == 16 and m >= 40) or (h == 7 and m >= 45) or (h == 15 and m >= 45)
 
         if should_scan:
             logger.info(f"Volatility scan at {now.strftime('%H:%M UTC')}")
@@ -448,8 +448,8 @@ async def trading_loop(_: Application) -> None:
                     logger.info(f"[{symbol}] Waiting for new 8h candle to open...")
                     continue
 
-                klines_1d = get_klines(symbol, "1d", limit=2)
-                klines_3m = get_klines(symbol, "3m", limit=30)
+                klines_1d = get_klines(symbol, "8h", limit=3)
+                klines_3m = get_klines(symbol, "1m", limit=30)
                 if len(klines_1d) < 2 or len(klines_3m) < 5:
                     continue
 

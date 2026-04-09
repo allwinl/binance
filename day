@@ -55,7 +55,7 @@ CHECK_INTERVAL_SECONDS = 15
 POSITION_TOLERANCE     = 1e-6
 MAX_ALLOWED_LOSS_USDT  = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
-TAKE_PROFIT_PCT = 20   # 20%
+TAKE_PROFIT_PCT = 0.5   # 20%
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing one or more of: API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID")
@@ -84,7 +84,7 @@ _price_precision_cache: Dict[str, int] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 
-COOLDOWN_SECONDS = 30  # Cooldown after opening a position
+COOLDOWN_SECONDS = 5  # Cooldown after opening a position
 
 # ────────────────────────────────────────────────
 # Telegram helpers
@@ -456,8 +456,8 @@ async def trading_loop(_: Application) -> None:
                     continue
 
                 # Fetch klines
-                klines_1d = get_klines(symbol, "1d", limit=2)
-                klines_3m = get_klines(symbol, "3m", limit=30)
+                klines_1d = get_klines(symbol, "8h", limit=2)
+                klines_3m = get_klines(symbol, "1m", limit=30)
 
                 if len(klines_1d) < 2 or len(klines_3m) < 5:
                     logger.warning(f"[{symbol}] Not enough klines data")
@@ -470,8 +470,9 @@ async def trading_loop(_: Application) -> None:
                 if len(sma_values) < 3:
                     continue
 
-                sma_current = sma_values[-1]
-                sma_prev     = sma_values[-2]
+                sma_current = sma_values[-2]
+                sma_prev     = sma_values[-3]
+                sma_prev1     = sma_values[-4]
 
                 logger.info(f"[{symbol}] Price={mark_price:.4f} | DayOpen={day_open:.4f} | "
                            f"SMA[-2]={sma_prev:.4f} | SMA[-1]={sma_current:.4f} | "
@@ -489,7 +490,7 @@ async def trading_loop(_: Application) -> None:
 
                     logger.info(f"[{symbol}] Checking ENTRY conditions...")
 
-                    if sma_prev > day_open:
+                    if sma_current > day_open and sma_prev < day_open:
                         logger.info(f"[{symbol}] LONG condition met → Placing BUY order")
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
@@ -501,7 +502,7 @@ async def trading_loop(_: Application) -> None:
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
 
-                    elif sma_prev < day_open:   # ← Changed to elif
+                    elif sma_current < day_open and sma_prev > day_open::   # ← Changed to elif
                         logger.info(f"[{symbol}] SHORT condition met → Placing SELL order")
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):
@@ -515,12 +516,12 @@ async def trading_loop(_: Application) -> None:
 
                 # ==================== EXIT LOGIC ====================
                 elif current_side == "LONG":
-                    if sma_prev < day_open:
+                    if sma_current < day_open:
                         logger.info(f"[{symbol}] LONG exit condition met")
                         close_position(symbol, "opposite SMA signal")
 
                 elif current_side == "SHORT":
-                    if sma_prev > day_open:
+                    if sma_current > day_open:
                         logger.info(f"[{symbol}] SHORT exit condition met")
                         close_position(symbol, "opposite SMA signal")
 

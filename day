@@ -502,7 +502,7 @@ async def trading_loop(_: Application) -> None:
                             logger.info(msg)
                             await send_telegram(msg, silent=False)
 
-                    elif sma_current < day_open and sma_prev > day_open::   # ← Changed to elif
+                    elif sma_current < day_open and sma_prev > day_open:   # ← Changed to elif
                         logger.info(f"[{symbol}] SHORT condition met → Placing SELL order")
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED", "PARTIALLY_FILLED"):

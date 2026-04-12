@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 from typing import Dict, Set, Optional, List
 import math
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from telegram import Update, Bot
 from telegram.ext import (
@@ -47,7 +47,7 @@ print("=== TESTNET MODE ===" if USE_TESTNET else "=== MAINNET – REAL MONEY ===
 
 FIXED_LEVERAGE = 5
 FIXED_MARGIN_TYPE = "ISOLATED"
-CHECK_INTERVAL_SECONDS = 15
+CHECK_INTERVAL_SECONDS = 10
 POSITION_TOLERANCE = 1e-6
 MAX_ALLOWED_LOSS_USDT = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
@@ -75,13 +75,14 @@ symbol_position_state: Dict[str, Optional[str]] = {}
 symbol_entry_price: Dict[str, Optional[float]] = {}
 symbol_last_entry_time: Dict[str, float] = {}
 symbol_last_exit_time: Dict[str, float] = {}
-symbol_candle_start_time: Dict[str, float] = {}
+symbol_candle_open_time: Dict[str, float] = {}   # Exact open timestamp of current 8h candle
 
 _price_precision_cache: Dict[str, int] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 
-POST_TP_SAFETY_SECONDS = 30 * 60   # 30 minutes safety after exit
+POST_TP_SAFETY_SECONDS = 30 * 60
+configured: Set[str] = set()
 
 # ────────────────────────────────────────────────
 # Telegram Helper
@@ -278,12 +279,6 @@ def cancel_all_orders(symbol: str) -> bool:
         logger.info(f"Cancelled all open orders for {symbol}")
     return success
 
-# ────────────────────────────────────────────────
-# Close Position with Realized PNL
-# ────────────────────────────────────────────────
-
-configured: Set[str] = set()
-
 def get_realized_pnl_for_symbol(symbol: str) -> Optional[float]:
     try:
         params = {"symbol": symbol, "limit": 50}
@@ -331,43 +326,44 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Volatility Selection
+# Amplitude Ratio
 # ────────────────────────────────────────────────
 
-def calculate_atr(klines: List[List], period: int = 8) -> float:
-    if len(klines) < period + 1:
+def calculate_amplitude_ratio(klines: List[List], period: int = 8) -> float:
+    if len(klines) < period:
         return 0.0
-    trs = []
-    for i in range(1, len(klines)):
-        high = float(klines[i][2])
-        low = float(klines[i][3])
-        prev_close = float(klines[i-1][4])
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    return sum(trs[-period:]) / period
+    amplitudes = []
+    for k in klines[-period:]:
+        open_price = float(k[1])
+        close_price = float(k[4])
+        if open_price == 0:
+            continue
+        pct_change = abs((close_price - open_price) / open_price) * 100
+        amplitudes.append(pct_change)
+    return sum(amplitudes) / len(amplitudes) if amplitudes else 0.0
 
 def get_highest_volatility_symbol() -> Optional[str]:
     symbols = get_all_perp_symbols()
     if not symbols:
         return None
+
     best_symbol = None
-    best_atr_pct = 0.0
-    for symbol in symbols[:120]:
+    best_amplitude = 0.0
+
+    for symbol in symbols[:150]:
         try:
             klines = get_klines(symbol, "8h", limit=20)
-            if len(klines) < 12:
+            if len(klines) < 8:
                 continue
-            atr = calculate_atr(klines)
-            price = get_current_price(symbol)
-            if price > 0:
-                atr_pct = (atr / price) * 100
-                if atr_pct > best_atr_pct:
-                    best_atr_pct = atr_pct
-                    best_symbol = symbol
-            time.sleep(0.12)
+            amplitude = calculate_amplitude_ratio(klines, period=8)
+            if amplitude > best_amplitude:
+                best_amplitude = amplitude
+                best_symbol = symbol
+            time.sleep(0.08)
         except Exception:
             continue
-    logger.info(f"Selected most volatile: {best_symbol} (ATR% ≈ {best_atr_pct:.2f})")
+
+    logger.info(f"Selected most volatile: {best_symbol} (Avg 8h Amplitude ≈ {best_amplitude:.2f}%)")
     return best_symbol
 
 # ────────────────────────────────────────────────
@@ -375,15 +371,16 @@ def get_highest_volatility_symbol() -> Optional[str]:
 # ────────────────────────────────────────────────
 
 async def auto_symbol_selection_task():
-    await send_telegram("🤖 8h Volatility Scanner Active\nScans at 23:45 | 07:45 | 15:45 UTC", silent=False)
+    await send_telegram("🤖 8h Amplitude Scanner Active\nScans ~15 min before candle close", silent=False)
+    
     while True:
         now = datetime.now(timezone.utc)
-        h, m = now.hour, now.minute
-        should_scan = (h == 23 and m >= 45) or (h == 7 and m >= 45) or (h == 15 and m >= 45)
+        should_scan = now.minute >= 45 and now.hour % 8 == 7   # 07:45, 15:45, 23:45 UTC
 
         if should_scan:
-            logger.info(f"Volatility scan at {now.strftime('%H:%M UTC')}")
+            logger.info(f"Amplitude scan started at {now.strftime('%H:%M UTC')}")
             new_symbol = get_highest_volatility_symbol()
+            
             if new_symbol:
                 for old in list(monitored_symbols):
                     if old != new_symbol:
@@ -392,25 +389,34 @@ async def auto_symbol_selection_task():
                         symbol_position_state.pop(old, None)
                         symbol_entry_price.pop(old, None)
                         symbol_last_exit_time.pop(old, None)
-                        symbol_candle_start_time.pop(old, None)
+                        symbol_candle_open_time.pop(old, None)
+                
                 if new_symbol not in monitored_symbols:
                     if ensure_leverage_and_margin(new_symbol):
                         monitored_symbols.add(new_symbol)
                         symbol_position_state[new_symbol] = None
                         symbol_last_exit_time[new_symbol] = 0
-                        symbol_candle_start_time[new_symbol] = 0
-                        await send_telegram(f"🔄 New volatile symbol selected:\n**{new_symbol}**\nWaiting for new 8h candle to open...", silent=False)
-            await asyncio.sleep(8 * 3600 - 900)
+                        symbol_candle_open_time[new_symbol] = 0
+                        
+                        amplitude = calculate_amplitude_ratio(get_klines(new_symbol, "8h", 20))
+                        await send_telegram(
+                            f"🔄 New volatile symbol selected:\n**{new_symbol}**\n"
+                            f"Avg 8h Amplitude: {amplitude:.2f}%\n"
+                            f"Waiting for next 8h candle to open before trading...",
+                            silent=False
+                        )
+            
+            await asyncio.sleep(8 * 3600 - 1800)
         else:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 # ────────────────────────────────────────────────
 # Trading Loop
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started – Per 8h candle + 2% TP + Realized PNL")
-    await send_telegram("Bot started • Auto volatile symbol every 8h • 2% TP • Realized PNL on close", silent=False)
+    logger.info("Trading loop started – Strict 8h candle open logic")
+    await send_telegram("Bot started • Amplitude-based symbol • Trades ONLY after new 8h candle opens", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -435,25 +441,30 @@ async def trading_loop(_: Application) -> None:
                 if qty < 1e-5:
                     continue
 
-                # Update candle start time
-                klines_8h = get_klines(symbol, "8h", limit=3)
-                if len(klines_8h) >= 2:
-                    candle_open_ts = int(klines_8h[-1][0]) / 1000.0
-                    symbol_candle_start_time[symbol] = candle_open_ts
+                # Get current 8h candle info
+                klines_8h = get_klines(symbol, "8h", limit=5)
+                if len(klines_8h) < 2:
+                    continue
 
-                candle_start = symbol_candle_start_time.get(symbol, 0)
+                current_candle_open_ts = int(klines_8h[-1][0]) / 1000.0
+
+                if symbol_candle_open_time.get(symbol, 0) != current_candle_open_ts:
+                    logger.info(f"[{symbol}] New 8h candle detected at {datetime.fromtimestamp(current_candle_open_ts, tz=timezone.utc)}")
+                    symbol_candle_open_time[symbol] = current_candle_open_ts
+
                 now_ts = time.time()
+                seconds_since_open = now_ts - current_candle_open_ts
 
-                if candle_start == 0 or now_ts < candle_start + 60:
-                    logger.info(f"[{symbol}] Waiting for new 8h candle to open...")
+                # Trading only allowed after candle has been open for at least 60 seconds
+                if seconds_since_open < 60:
                     continue
 
-                klines_1d = get_klines(symbol, "8h", limit=3)
+                # Get signal data
+                day_open = float(klines_8h[-1][1])
                 klines_3m = get_klines(symbol, "1m", limit=30)
-                if len(klines_1d) < 2 or len(klines_3m) < 5:
+                if len(klines_3m) < 5:
                     continue
 
-                day_open = float(klines_1d[-1][1])
                 closes = [float(k[4]) for k in klines_3m]
                 sma_values = [sum(closes[i-2:i+1]) / 3 for i in range(2, len(closes))]
                 if len(sma_values) < 3:
@@ -500,7 +511,7 @@ async def trading_loop(_: Application) -> None:
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "SMA(3) Crossover Bot\n\nCommands:\n/add SYMBOL\n/rem SYMBOL\n/list\n/reset"
+    text = "SMA(3) Crossover Bot\n\nCommands:\n/add SYMBOL\n/rem SYMBOL\n/list\n/status\n/reset"
     await update.message.reply_text(text)
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,6 +524,51 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"  {sym:10}  {side}")
     await update.message.reply_text("\n".join(lines))
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not monitored_symbols:
+        await update.message.reply_text("No symbols are currently monitored.")
+        return
+
+    lines = ["📊 **Bot Status**"]
+    now_ts = time.time()
+
+    for sym in sorted(monitored_symbols):
+        side = symbol_position_state.get(sym, "None")
+        entry = symbol_entry_price.get(sym)
+        candle_open_ts = symbol_candle_open_time.get(sym, 0)
+        last_exit = symbol_last_exit_time.get(sym, 0)
+
+        status_lines = [f"**{sym}**"]
+
+        if side != "None":
+            status_lines.append(f"Position: {side}")
+            if entry:
+                status_lines.append(f"Entry: {entry:.2f}")
+        else:
+            status_lines.append("Position: No open position")
+
+        if candle_open_ts > 0:
+            candle_time = datetime.fromtimestamp(candle_open_ts, tz=timezone.utc)
+            seconds_since = int(now_ts - candle_open_ts)
+            minutes_since = seconds_since // 60
+            status_lines.append(f"Candle opened: {candle_time.strftime('%H:%M UTC')} ({minutes_since} min ago)")
+            
+            if seconds_since < 60:
+                status_lines.append("⏳ Waiting for candle to mature...")
+            else:
+                status_lines.append("✅ Trading allowed on this candle")
+        else:
+            status_lines.append("Candle: Not detected yet")
+
+        if last_exit > 0 and (now_ts - last_exit) < POST_TP_SAFETY_SECONDS:
+            safety_left = int(POST_TP_SAFETY_SECONDS - (now_ts - last_exit)) // 60
+            status_lines.append(f"🛡️ Safety period: {safety_left} min left")
+
+        lines.append("\n".join(status_lines))
+        lines.append("─" * 30)
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     closed = [sym for sym in list(monitored_symbols) if close_position(sym, "reset")]
     monitored_symbols.clear()
@@ -520,7 +576,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol_entry_price.clear()
     symbol_last_entry_time.clear()
     symbol_last_exit_time.clear()
-    symbol_candle_start_time.clear()
+    symbol_candle_open_time.clear()
     configured.clear()
     text = "Full reset performed."
     if closed:
@@ -542,7 +598,7 @@ async def try_add_symbol(symbol: str, from_user_id: int, reply_func) -> None:
         monitored_symbols.add(symbol)
         symbol_position_state[symbol] = None
         symbol_last_exit_time[symbol] = 0
-        symbol_candle_start_time[symbol] = 0
+        symbol_candle_open_time[symbol] = 0
         logger.info(f"Added {symbol}")
         if reply_func:
             await reply_func(f"Added {symbol}")
@@ -561,7 +617,7 @@ async def try_remove_symbol(symbol: str, from_user_id: int, reply_func) -> None:
     symbol_position_state.pop(symbol, None)
     symbol_entry_price.pop(symbol, None)
     symbol_last_exit_time.pop(symbol, None)
-    symbol_candle_start_time.pop(symbol, None)
+    symbol_candle_open_time.pop(symbol, None)
     configured.discard(symbol)
     logger.info(f"Removed {symbol}")
     if reply_func:
@@ -602,7 +658,7 @@ async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT
 async def on_startup(app: Application) -> None:
     asyncio.create_task(trading_loop(app))
     asyncio.create_task(auto_symbol_selection_task())
-    logger.info("All tasks started")
+    logger.info("All tasks started successfully")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -611,6 +667,7 @@ def main():
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("rem", cmd_rem))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("status", cmd_status))   # ← New command
     app.add_handler(CommandHandler("reset", cmd_reset))
 
     if ALERT_BOT_USER_ID:
@@ -621,7 +678,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("Bot starting...")
+    print("Bot starting with /status command...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

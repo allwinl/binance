@@ -75,7 +75,7 @@ symbol_position_state: Dict[str, Optional[str]] = {}
 symbol_entry_price: Dict[str, Optional[float]] = {}
 symbol_last_exit_time: Dict[str, float] = {}
 symbol_candle_open_time: Dict[str, float] = {}
-symbol_tradeable_from_candle: Dict[str, float] = {}   # Next candle to trade on
+symbol_tradeable_from_candle: Dict[str, float] = {}
 
 _price_precision_cache: Dict[str, int] = {}
 
@@ -95,7 +95,7 @@ async def send_telegram(msg: str, silent: bool = True):
         logger.error(f"Telegram send failed: {e}")
 
 # ────────────────────────────────────────────────
-# Binance API Helpers (unchanged)
+# Binance API Helpers
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
@@ -281,7 +281,6 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
 
     if success:
         direction = "LONG" if amt > 0 else "SHORT"
-        realized_pnl = None  # simplified
         asyncio.create_task(send_telegram(f"Closed {direction} {symbol} → {reason}"))
         symbol_position_state[symbol] = None
         symbol_entry_price[symbol] = None
@@ -289,25 +288,22 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Get Amplitude from Specific Previous Candle
+# Amplitude from Previous Candle
 # ────────────────────────────────────────────────
 
 def get_candle_amplitude(symbol: str, candle_open_ts: float) -> float:
-    """Get amplitude of a specific 8h candle"""
     klines = get_klines(symbol, "8h", limit=20)
     for k in klines:
-        if abs(int(k[0])/1000 - candle_open_ts) < 10:   # match candle
+        if abs(int(k[0])/1000 - candle_open_ts) < 60:
             open_p = float(k[1])
             close_p = float(k[4])
             if open_p == 0: return 0.0
             return round(abs((close_p - open_p) / open_p) * 100, 2)
     return 0.0
 
-def get_previous_candle_for_trading(now: datetime) -> float:
-    """Returns the open timestamp of the candle to use for amplitude (previous one)"""
-    hour = now.hour
-    candle_start_hour = (hour // 8) * 8
-    current_candle = now.replace(hour=candle_start_hour, minute=0, second=0, microsecond=0)
+def get_previous_candle_ts(now: datetime) -> float:
+    hour = (now.hour // 8) * 8
+    current_candle = now.replace(hour=hour, minute=0, second=0, microsecond=0)
     previous_candle = current_candle - timedelta(hours=8)
     return previous_candle.timestamp()
 
@@ -316,8 +312,7 @@ def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
     if not symbols:
         return None
 
-    target_candle_ts = get_previous_candle_for_trading(now)
-
+    target_candle_ts = get_previous_candle_ts(now)
     best_symbol = None
     best_amplitude = 0.0
 
@@ -331,30 +326,28 @@ def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
         except Exception:
             continue
 
-    logger.info(f"Selected {best_symbol} using {datetime.fromtimestamp(target_candle_ts, tz=timezone.utc).strftime('%H:%M')} candle | Amplitude: {best_amplitude:.2f}%")
+    if best_symbol:
+        logger.info(f"Selected {best_symbol} | Amplitude from {datetime.fromtimestamp(target_candle_ts, tz=timezone.utc).strftime('%H:%M')} candle: {best_amplitude:.2f}%")
     return best_symbol
 
 # ────────────────────────────────────────────────
-# Auto Symbol Selection Task
+# Auto Symbol Selection
 # ────────────────────────────────────────────────
 
 async def auto_symbol_selection_task():
-    await send_telegram("🤖 8h Scanner Active\n"
-                        "Uses previous completed candle amplitude\n"
-                        "Trades only on the next 8h candle", silent=False)
+    await send_telegram("🤖 Scanner Active\nUses previous 8h candle for selection\nTrades only on next candle", silent=False)
     
     while True:
         now = datetime.now(timezone.utc)
-        should_scan = now.minute >= 45 and now.hour % 8 == 7   # 07:45, 15:45, 23:45
+        should_scan = now.minute >= 45 and now.hour % 8 == 7
 
         if should_scan:
-            logger.info(f"Scan started at {now.strftime('%H:%M UTC')}")
             new_symbol = get_highest_volatility_symbol(now)
             
             if new_symbol:
                 for old in list(monitored_symbols):
                     if old != new_symbol:
-                        close_position(old, "switching symbol")
+                        close_position(old, "switching")
                         monitored_symbols.discard(old)
                         symbol_position_state.pop(old, None)
                         symbol_entry_price.pop(old, None)
@@ -369,15 +362,14 @@ async def auto_symbol_selection_task():
                         symbol_last_exit_time[new_symbol] = 0
                         symbol_candle_open_time[new_symbol] = 0
                         
-                        # Next candle = trading candle
                         next_candle = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
                         symbol_tradeable_from_candle[new_symbol] = next_candle.timestamp()
                         
-                        amp_candle = get_previous_candle_for_trading(now)
-                        amp = get_candle_amplitude(new_symbol, amp_candle)
+                        amp_ts = get_previous_candle_ts(now)
+                        amp = get_candle_amplitude(new_symbol, amp_ts)
                         await send_telegram(
-                            f"🔄 New symbol selected:\n**{new_symbol}**\n"
-                            f"Using {datetime.fromtimestamp(amp_candle, tz=timezone.utc).strftime('%H:%M')} candle amplitude: {amp:.2f}%\n"
+                            f"🔄 New symbol: **{new_symbol}**\n"
+                            f"Amplitude from previous candle: {amp:.2f}%\n"
                             f"Trading starts at {next_candle.strftime('%H:%M UTC')}",
                             silent=False
                         )
@@ -386,16 +378,13 @@ async def auto_symbol_selection_task():
         else:
             await asyncio.sleep(30)
 
-# Trading Loop and Command Handlers remain the same as previous version
-# (I kept them short here for brevity — copy the trading_loop, cmd_start, cmd_status, etc. from the last code I gave you)
-
-# ... [Paste the full trading_loop, close_position improvements, command handlers from previous response here]
-
-# For completeness, here is the main part:
+# ────────────────────────────────────────────────
+# Trading Loop
+# ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started – Strict next candle logic")
-    await send_telegram("Bot started • Uses previous 8h candle for selection", silent=False)
+    logger.info("Trading loop started")
+    await send_telegram("Bot started in TESTNET • Previous candle selection logic", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -412,7 +401,7 @@ async def trading_loop(_: Application) -> None:
                 if pos and MAX_ALLOWED_LOSS_USDT < 0:
                     pnl = float(pos.get("unRealizedProfit", 0))
                     if pnl < MAX_ALLOWED_LOSS_USDT:
-                        close_position(symbol, "max loss")
+                        close_position(symbol, "max loss cut")
                         continue
 
                 qty = calculate_safe_quantity(symbol)
@@ -420,31 +409,32 @@ async def trading_loop(_: Application) -> None:
                     continue
 
                 klines_8h = get_klines(symbol, "8h", limit=5)
-                if len(klines_8h) < 2: continue
+                if len(klines_8h) < 2:
+                    continue
 
                 current_candle_open_ts = int(klines_8h[-1][0]) / 1000.0
 
                 if symbol_candle_open_time.get(symbol, 0) != current_candle_open_ts:
                     symbol_candle_open_time[symbol] = current_candle_open_ts
-                    logger.info(f"[{symbol}] Candle opened: {datetime.fromtimestamp(current_candle_open_ts, tz=timezone.utc)}")
+                    logger.info(f"[{symbol}] New candle opened")
 
                 now_ts = time.time()
                 if now_ts - current_candle_open_ts < 60:
                     continue
 
-                # Strict check
                 tradeable_from = symbol_tradeable_from_candle.get(symbol, 0)
                 if current_candle_open_ts < tradeable_from - 10:
                     continue
 
-                # Signal logic (SMA3 vs candle open)
                 day_open = float(klines_8h[-1][1])
                 klines_1m = get_klines(symbol, "1m", limit=30)
-                if len(klines_1m) < 10: continue
+                if len(klines_1m) < 10:
+                    continue
 
                 closes = [float(k[4]) for k in klines_1m]
                 sma_values = [sum(closes[i-2:i+1])/3 for i in range(2, len(closes))]
-                if len(sma_values) < 3: continue
+                if len(sma_values) < 3:
+                    continue
                 sma_prev = sma_values[-2]
 
                 in_safety = (now_ts - symbol_last_exit_time.get(symbol, 0)) < POST_TP_SAFETY_SECONDS
@@ -456,29 +446,170 @@ async def trading_loop(_: Application) -> None:
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
                             place_take_profit_order(symbol, "LONG", qty, mark_price)
-                            await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f}", silent=False)
+                            await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} (TP {TAKE_PROFIT_PCT}%)", silent=False)
                     elif sma_prev < day_open:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
                             place_take_profit_order(symbol, "SHORT", qty, mark_price)
-                            await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f}", silent=False)
+                            await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} (TP {TAKE_PROFIT_PCT}%)", silent=False)
 
                 elif current_side == "LONG" and sma_prev < day_open:
-                    close_position(symbol, "opposite signal")
+                    close_position(symbol, "opposite SMA signal")
                 elif current_side == "SHORT" and sma_prev > day_open:
-                    close_position(symbol, "opposite signal")
+                    close_position(symbol, "opposite SMA signal")
 
             except Exception as e:
                 logger.error(f"[{symbol}] Error: {e}", exc_info=True)
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-# (Add the remaining command handlers: cmd_start, cmd_list, cmd_status, cmd_reset, try_add_symbol, etc. — they are the same as in the previous full code)
+# ────────────────────────────────────────────────
+# Command Handlers
+# ────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "SMA(3) Crossover Bot\n\nCommands:\n/add SYMBOL\n/rem SYMBOL\n/list\n/status\n/reset"
+    await update.message.reply_text(text)
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not monitored_symbols:
+        await update.message.reply_text("No symbols monitored.")
+        return
+    lines = ["Monitored symbols:"]
+    for sym in sorted(monitored_symbols):
+        side = symbol_position_state.get(sym, "—")
+        lines.append(f"  {sym:10}  {side}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not monitored_symbols:
+        await update.message.reply_text("No symbols are currently monitored.")
+        return
+    lines = ["📊 **Bot Status**"]
+    now_ts = time.time()
+    for sym in sorted(monitored_symbols):
+        status_lines = [f"**{sym}**"]
+        side = symbol_position_state.get(sym, "None")
+        entry = symbol_entry_price.get(sym)
+        tradeable_from = symbol_tradeable_from_candle.get(sym, 0)
+        candle_ts = symbol_candle_open_time.get(sym, 0)
+
+        if side != "None":
+            status_lines.append(f"Position: {side}")
+            if entry:
+                status_lines.append(f"Entry: {entry:.2f}")
+        else:
+            status_lines.append("Position: No open position")
+
+        if tradeable_from > 0:
+            status_lines.append(f"Trading from: {datetime.fromtimestamp(tradeable_from, tz=timezone.utc).strftime('%H:%M UTC')}")
+
+        if candle_ts > 0:
+            minutes_ago = int((now_ts - candle_ts) // 60)
+            status_lines.append(f"Current candle: {minutes_ago} min ago")
+
+        lines.append("\n".join(status_lines))
+        lines.append("─" * 30)
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    closed = [sym for sym in list(monitored_symbols) if close_position(sym, "reset")]
+    monitored_symbols.clear()
+    symbol_position_state.clear()
+    symbol_entry_price.clear()
+    symbol_last_exit_time.clear()
+    symbol_candle_open_time.clear()
+    symbol_tradeable_from_candle.clear()
+    configured.clear()
+    text = "Full reset performed."
+    if closed:
+        text += f"\nClosed: {', '.join(closed)}"
+    await update.message.reply_text(text)
+    await send_telegram("Bot reset – no symbols monitored")
+
+async def try_add_symbol(symbol: str, reply_func=None):
+    symbol = symbol.strip().upper()
+    if not symbol.endswith("USDT") or symbol not in get_all_perp_symbols():
+        if reply_func:
+            await reply_func(f"Invalid symbol: {symbol}")
+        return
+    if symbol in monitored_symbols:
+        if reply_func:
+            await reply_func(f"{symbol} already monitored")
+        return
+    if ensure_leverage_and_margin(symbol):
+        monitored_symbols.add(symbol)
+        symbol_position_state[symbol] = None
+        symbol_last_exit_time[symbol] = 0
+        symbol_candle_open_time[symbol] = 0
+        symbol_tradeable_from_candle[symbol] = 0
+        logger.info(f"Added {symbol}")
+        if reply_func:
+            await reply_func(f"Added {symbol}")
+    else:
+        if reply_func:
+            await reply_func(f"Failed to configure {symbol}")
+
+async def try_remove_symbol(symbol: str, reply_func=None):
+    symbol = symbol.strip().upper()
+    if symbol not in monitored_symbols:
+        if reply_func:
+            await reply_func(f"{symbol} not monitored")
+        return
+    closed = close_position(symbol, "remove")
+    monitored_symbols.remove(symbol)
+    symbol_position_state.pop(symbol, None)
+    symbol_entry_price.pop(symbol, None)
+    symbol_last_exit_time.pop(symbol, None)
+    symbol_candle_open_time.pop(symbol, None)
+    symbol_tradeable_from_candle.pop(symbol, None)
+    configured.discard(symbol)
+    if reply_func:
+        await reply_func(f"Removed {symbol}")
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /add BTCUSDT")
+        return
+    await try_add_symbol(context.args[0], update.message.reply_text)
+
+async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /rem BTCUSDT")
+        return
+    await try_remove_symbol(context.args[0], update.message.reply_text)
+
+async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ALERT_BOT_USER_ID:
+        return
+    text = update.message.text.strip().upper()
+    if not text.startswith(("/add ", "/rem ")):
+        return
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return
+    cmd = parts[0]
+    symbol = parts[1].strip()
+    if cmd == "/add":
+        await try_add_symbol(symbol)
+    elif cmd == "/rem":
+        await try_remove_symbol(symbol)
+
+# ────────────────────────────────────────────────
+# Startup
+# ────────────────────────────────────────────────
+
+async def on_startup(app: Application) -> None:
+    asyncio.create_task(trading_loop(app))
+    asyncio.create_task(auto_symbol_selection_task())
+    logger.info("All tasks started successfully")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("rem", cmd_rem))
@@ -486,13 +617,17 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
 
+    if ALERT_BOT_USER_ID:
+        app.add_handler(MessageHandler(
+            filters.Regex(r'^/(add|rem)\s+') &
+            (filters.ChatType.PRIVATE | filters.Chat(chat_id=int(TELEGRAM_CHAT_ID))),
+            handle_alert_bot_message
+        ))
+
     app.post_init = on_startup
-    print("Bot starting with consistent previous-candle amplitude logic...")
+    print("Bot starting with fixed previous-candle logic...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-async def on_startup(app: Application) -> None:
-    asyncio.create_task(trading_loop(app))
-    asyncio.create_task(auto_symbol_selection_task())
 
 if __name__ == "__main__":
     main()

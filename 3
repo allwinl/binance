@@ -51,7 +51,7 @@ CHECK_INTERVAL_SECONDS = 10
 POSITION_TOLERANCE = 1e-6
 MAX_ALLOWED_LOSS_USDT = trading_cfg.get("max_allowed_loss_usdt", -1.0)
 
-TAKE_PROFIT_PCT = 2.0
+TAKE_PROFIT_PCT = 20.0
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing one or more config values")
@@ -553,7 +553,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             minutes_since = seconds_since // 60
             status_lines.append(f"Candle opened: {candle_time.strftime('%H:%M UTC')} ({minutes_since} min ago)")
             
-            if seconds_since < 60:
+            if seconds_since < 1:
                 status_lines.append("⏳ Waiting for candle to mature...")
             else:
                 status_lines.append("✅ Trading allowed on this candle")

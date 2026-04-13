@@ -95,7 +95,7 @@ async def send_telegram(msg: str, silent: bool = True):
         logger.error(f"Telegram send failed: {e}")
 
 # ────────────────────────────────────────────────
-# Binance API Helpers (unchanged)
+# Binance API Helpers
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
@@ -288,17 +288,16 @@ def close_position(symbol: str, reason: str = "manual") -> bool:
     return success
 
 # ────────────────────────────────────────────────
-# Improved Amplitude + Candle Functions
+# Improved Candle & Volatility Functions
 # ────────────────────────────────────────────────
 
 def get_previous_candle_ts(now: datetime) -> float:
-    """Return open timestamp of the PREVIOUS completed 8h candle (00:00, 08:00, 16:00 UTC)"""
+    """Return open timestamp of the PREVIOUS completed 8h candle"""
     hour = now.hour
     candle_hour = (hour // 8) * 8
     current_candle = now.replace(hour=candle_hour, minute=0, second=0, microsecond=0)
 
-    # If we are in the first 10 minutes of a new candle, still consider the previous one as "last completed"
-    if (now - current_candle).total_seconds() < 600:
+    if (now - current_candle).total_seconds() < 600:   # first 10 min of new candle
         current_candle -= timedelta(hours=8)
 
     previous_candle = current_candle - timedelta(hours=8)
@@ -318,7 +317,7 @@ def get_candle_amplitude(symbol: str, candle_open_ts: float) -> float:
     return 0.0
 
 
-def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
+async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
     symbols = get_all_perp_symbols()
     if not symbols:
         logger.error("No perpetual USDT symbols fetched")
@@ -328,64 +327,63 @@ def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
     best_symbol = None
     best_amplitude = -1.0
     best_volume = 0.0
-    top_results = []   # For logging top 5
+    top_results = []
 
-    logger.info(f"Scanning {len(symbols)} USDT perpetual symbols...")
+    logger.info(f"Scanning {len(symbols)} USDT perpetual symbols for previous 8h candle...")
 
     for symbol in symbols:
         try:
             amp = get_candle_amplitude(symbol, target_candle_ts)
 
-            # Get quote volume (USDT volume) for tie-breaking
+            # Get USDT volume for tie-breaker
             volume = 0.0
             klines = get_klines(symbol, "8h", limit=20)
             for k in klines:
                 if abs(int(k[0])/1000 - target_candle_ts) < 300:
-                    volume = float(k[5])  # quote asset volume
+                    volume = float(k[5])
                     break
 
-            # Update best (use volume as tie-breaker)
             if amp > best_amplitude or (abs(amp - best_amplitude) < 0.1 and volume > best_volume * 1.1):
                 best_amplitude = amp
                 best_volume = volume
                 best_symbol = symbol
 
-            # Keep top 5
+            # Keep top 5 for logging
             top_results.append((symbol, amp, volume))
             if len(top_results) > 5:
                 top_results.sort(key=lambda x: x[1], reverse=True)
                 top_results = top_results[:5]
 
-            await asyncio.sleep(0.08)  # Safe rate limit (~12 req/sec)
+            await asyncio.sleep(0.08)  # Rate limit safety
 
         except Exception:
             continue
 
     if best_symbol:
         logger.info(f"SELECTED → {best_symbol} | Amplitude: {best_amplitude:.2f}% | Volume: {best_volume:,.0f} USDT")
-        logger.info("Top 5 most volatile symbols in previous 8h candle:")
+        logger.info("Top 5 most volatile symbols:")
         for sym, amp, vol in sorted(top_results, key=lambda x: x[1], reverse=True):
             logger.info(f"  {sym:12} → {amp:6.2f}%   Vol: {vol:,.0f} USDT")
 
     return best_symbol
+
 
 # ────────────────────────────────────────────────
 # Auto Symbol Selection Task
 # ────────────────────────────────────────────────
 
 async def auto_symbol_selection_task():
-    await send_telegram("🤖 Scanner Active\nNow scanning ALL symbols\nBased on previous 8h candle volatility", silent=False)
+    await send_telegram("🤖 Scanner Active\nScanning ALL symbols\nBased on previous 8h candle volatility", silent=False)
     
     while True:
         now = datetime.now(timezone.utc)
-        # Scan near the end of every 8h candle (07:45, 15:45, 23:45 UTC)
         should_scan = now.minute >= 45 and now.hour % 8 == 7
 
         if should_scan:
-            new_symbol = get_highest_volatility_symbol(now)
+            new_symbol = await get_highest_volatility_symbol(now)   # ← await added here
             
             if new_symbol:
-                # Close and remove old symbols
+                # Close old symbols
                 for old in list(monitored_symbols):
                     if old != new_symbol:
                         close_position(old, "switching")
@@ -406,8 +404,7 @@ async def auto_symbol_selection_task():
                         next_candle = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
                         symbol_tradeable_from_candle[new_symbol] = next_candle.timestamp()
                         
-                        amp_ts = get_previous_candle_ts(now)
-                        amp = get_candle_amplitude(new_symbol, amp_ts)
+                        amp = get_candle_amplitude(new_symbol, get_previous_candle_ts(now))
                         await send_telegram(
                             f"🔄 New symbol selected: **{new_symbol}**\n"
                             f"Previous 8h amplitude: {amp:.2f}%\n"
@@ -415,18 +412,17 @@ async def auto_symbol_selection_task():
                             silent=False
                         )
             
-            # Sleep until next possible scan (~8 hours)
             await asyncio.sleep(8 * 3600 - 1800)
         else:
             await asyncio.sleep(30)
 
 # ────────────────────────────────────────────────
-# Trading Loop (unchanged)
+# Trading Loop
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
     logger.info("Trading loop started")
-    await send_telegram("Bot started in TESTNET • Full symbol scan + improved candle logic", silent=False)
+    await send_telegram("Bot started in TESTNET • Full symbol scan + improved logic", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -508,7 +504,7 @@ async def trading_loop(_: Application) -> None:
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # ────────────────────────────────────────────────
-# Command Handlers (unchanged)
+# Command Handlers
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

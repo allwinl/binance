@@ -449,7 +449,7 @@ async def trading_loop(_: Application) -> None:
                 if current_side is None and not in_safety:
                     if realized_pnl >= profit_threshold: continue
 
-                    if sma[-2] > day_open: # and sma[-3] < day_open:   # Long
+                    if sma[-2] > day_open and sma[-3] < day_open:   # Long
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "LONG"
@@ -457,7 +457,7 @@ async def trading_loop(_: Application) -> None:
                             await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
-                    elif sma[-2] < day_open: # and sma[-3] > day_open:  # Short
+                    elif sma[-2] < day_open and sma[-3] > day_open:  # Short
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "SHORT"

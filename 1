@@ -54,7 +54,7 @@ BASE_TP_PCT = 5.0
 OFFSET_PCT = 5.0
 PROFIT_LOCK_PCT = 5.0
 MAX_DRAWDOWN_PCT = 2.0
-SAFETY_COOLDOWN_SECONDS = 60  # 5 minutes cooldown after safety exit
+SAFETY_COOLDOWN_SECONDS = 300  # 5 minutes
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing one or more config values")
@@ -82,7 +82,7 @@ symbol_candle_open_time: Dict[str, float] = {}
 symbol_tradeable_from_candle: Dict[str, float] = {}
 symbol_cumulative_realized_loss: Dict[str, float] = {}
 symbol_realized_pnl_this_candle: Dict[str, float] = {}
-symbol_last_direction: Dict[str, Optional[str]] = {}   # Track last direction after safety exit
+symbol_last_direction: Dict[str, Optional[str]] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 configured: Set[str] = set()
@@ -122,8 +122,6 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
         return data
     except Exception as e:
         logger.error(f"Request failed {endpoint}: {e}")
-        if 'r' in locals() and hasattr(r, 'text'):
-            logger.error(f"Response body: {r.text}")
         return {"error": str(e)}
 
 def public_get(endpoint: str, params: Dict = None) -> list | dict:
@@ -138,10 +136,13 @@ def public_get(endpoint: str, params: Dict = None) -> list | dict:
 
 def get_all_perp_symbols() -> List[str]:
     data = public_get("/fapi/v1/exchangeInfo")
-    return [s["symbol"] for s in data.get("symbols", []) 
-            if s.get("contractType") == "PERPETUAL" 
-            and s.get("status") == "TRADING" 
-            and s.get("quoteAsset") == "USDT"]
+    valid_symbols = []
+    for s in data.get("symbols", []):
+        if (s.get("contractType") == "PERPETUAL" and 
+            s.get("status") == "TRADING" and 
+            s.get("quoteAsset") == "USDT"):
+            valid_symbols.append(s["symbol"])
+    return valid_symbols
 
 def get_price_precision(symbol: str) -> int:
     data = public_get("/fapi/v1/exchangeInfo")
@@ -311,7 +312,7 @@ def get_realized_pnl_this_candle(symbol: str, candle_open_ts: float) -> float:
     return realized
 
 # ────────────────────────────────────────────────
-# 8h Candle & Symbol Selection
+# 8h Candle & Symbol Selection (Strict TRADING Status)
 # ────────────────────────────────────────────────
 
 def get_current_candle_ts(now: datetime) -> float:
@@ -331,13 +332,15 @@ def get_candle_amplitude(symbol: str, candle_open_ts: float) -> float:
     return 0.0
 
 async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
-    symbols = get_all_perp_symbols()
-    if not symbols: return None
+    all_symbols = get_all_perp_symbols()  # Already filtered with TRADING status
+    if not all_symbols:
+        return None
+
     target = get_current_candle_ts(now)
     best_symbol = None
     best_amp = -1.0
 
-    for symbol in symbols:
+    for symbol in all_symbols:
         try:
             amp = get_candle_amplitude(symbol, target)
             if amp > best_amp:
@@ -346,12 +349,13 @@ async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
             await asyncio.sleep(0.08)
         except:
             continue
+
     if best_symbol:
-        logger.info(f"SELECTED → {best_symbol} | Amplitude: {best_amp:.2f}%")
+        logger.info(f"SELECTED → {best_symbol} | Amplitude: {best_amp:.2f}% (TRADING)")
     return best_symbol
 
 async def auto_symbol_selection_task():
-    await send_telegram("🤖 Scanner Active - 8h Amplitude Based", silent=False)
+    await send_telegram("🤖 Scanner Active - 8h Amplitude Based (TRADING only)", silent=False)
     while True:
         now = datetime.now(timezone.utc)
         should_scan = now.minute >= 45 and now.hour % 8 == 7
@@ -390,12 +394,12 @@ async def auto_symbol_selection_task():
             await asyncio.sleep(30)
 
 # ────────────────────────────────────────────────
-# Trading Loop
+# Trading Loop (Momentum + Anti-Whipsaw)
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Simple Momentum Entry + Anti-Whipsaw Protection")
-    await send_telegram("Bot started • Simple Momentum Entry + Safety Protection", silent=False)
+    logger.info("Trading loop started - Momentum Entry + Anti-Whipsaw")
+    await send_telegram("Bot started • Momentum Entry + Safety Protection", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -450,14 +454,13 @@ async def trading_loop(_: Application) -> None:
                 time_since_safety = now_ts - symbol_last_safety_exit_time.get(symbol, 0)
                 in_safety = time_since_last_exit < SAFETY_COOLDOWN_SECONDS
 
-                # ==================== ENTRY ====================
+                # ENTRY
                 if current_side is None and not in_safety:
                     if realized_pnl >= profit_threshold: continue
 
                     long_condition = sma[-2] > day_open
                     short_condition = sma[-2] < day_open
 
-                    # Anti-Whipsaw: Prevent same direction re-entry after safety exit
                     last_dir = symbol_last_direction.get(symbol)
                     if time_since_safety < SAFETY_COOLDOWN_SECONDS:
                         if last_dir == "LONG" and long_condition:
@@ -483,7 +486,7 @@ async def trading_loop(_: Application) -> None:
                             await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
                             place_take_profit_order(symbol, "SELL", mark_price, dynamic_tp, qty)
 
-                # ==================== EXIT ====================
+                # EXIT
                 elif current_side is not None:
                     pos = get_current_position_data(symbol)
                     unrealized = float(pos.get("unRealizedProfit", 0))
@@ -493,7 +496,6 @@ async def trading_loop(_: Application) -> None:
                         close_position(symbol, f"drawdown protection (-{MAX_DRAWDOWN_PCT}%)")
                         continue
 
-                    # Safety Offset Exit
                     if current_side == "LONG":
                         upper = day_open * (1 + OFFSET_PCT / 100.0)
                         if sma[-2] < upper and sma[-3] > upper:
@@ -656,7 +658,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("Bot starting with Momentum Entry + Anti-Whipsaw Protection...")
+    print("Bot starting with TRADING status filter + Momentum Entry...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

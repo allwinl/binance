@@ -54,7 +54,7 @@ BASE_TP_PCT = 5.0
 OFFSET_PCT = 5.0
 PROFIT_LOCK_PCT = 5.0
 MAX_DRAWDOWN_PCT = 2.0
-SAFETY_COOLDOWN_SECONDS = 300
+SAFETY_COOLDOWN_SECONDS = 3
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing one or more config values")
@@ -83,7 +83,7 @@ symbol_tradeable_from_candle: Dict[str, float] = {}
 symbol_cumulative_realized_loss: Dict[str, float] = {}
 symbol_realized_pnl_this_candle: Dict[str, float] = {}
 symbol_last_direction: Dict[str, Optional[str]] = {}
-symbol_locked_until_candle: Dict[str, float] = {}   # Lock symbol for current 8h candle
+symbol_locked_until_candle: Dict[str, float] = {}   # NEW: Lock for current 8h candle
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 configured: Set[str] = set()
@@ -99,7 +99,7 @@ async def send_telegram(msg: str, silent: bool = True):
         logger.error(f"Telegram send failed: {e}")
 
 # ────────────────────────────────────────────────
-# Binance API Helpers
+# Binance API Helpers (Same as Original)
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
@@ -221,7 +221,7 @@ def calculate_safe_quantity(symbol: str) -> float:
             break
     price = get_current_price(symbol)
     if price <= 0: return 0.0
-    target_usdt = min_notional * 10
+    target_usdt = min_notional * 1.5
     raw_qty = target_usdt / price
     steps = math.ceil(raw_qty / step_size)
     qty = max(steps * step_size, min_qty)
@@ -256,11 +256,18 @@ def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_perce
         "stopPrice": tp_price_str,
         "reduceOnly": "true",
         "workingType": "MARK_PRICE",
-        "priceProtect": "true"
+        "priceProtect": "true",
+        "algoType": "CONDITIONAL"
     }
 
     logger.info(f"Dynamic TP {tp_percent:.1f}% on {symbol} | Trigger @ {tp_price_str}")
-    return signed_request("POST", "/fapi/v1/order", params)
+    resp = signed_request("POST", "/fapi/v1/algoOrder", params)   # ← Back to original
+
+    if isinstance(resp, dict) and "algoId" in resp:
+        logger.info(f"✅ TP placed - algoId: {resp.get('algoId')}")
+    else:
+        logger.error(f"❌ TP failed: {resp}")
+    return resp
 
 def cancel_all_orders(symbol: str) -> bool:
     signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
@@ -318,7 +325,7 @@ def get_current_candle_ts(now: datetime) -> float:
     return current_candle.timestamp()
 
 # ────────────────────────────────────────────────
-# Auto Symbol Selection
+# Auto Symbol Selection (Same as Original)
 # ────────────────────────────────────────────────
 
 async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
@@ -332,6 +339,7 @@ async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
 
     for symbol in all_symbols:
         try:
+            amp = 0.0
             klines = get_klines(symbol, "8h", limit=20)
             for k in klines:
                 k_open_ts = int(k[0]) / 1000.0
@@ -339,20 +347,20 @@ async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
                     open_p = float(k[1])
                     close_p = float(k[4])
                     amp = round(abs((close_p - open_p) / open_p) * 100, 2) if open_p != 0 else 0.0
-                    if amp > best_amp:
-                        best_amp = amp
-                        best_symbol = symbol
                     break
+            if amp > best_amp:
+                best_amp = amp
+                best_symbol = symbol
             await asyncio.sleep(0.08)
         except:
             continue
 
     if best_symbol:
-        logger.info(f"SELECTED → {best_symbol} | Amplitude: {best_amp:.2f}%")
+        logger.info(f"SELECTED → {best_symbol} | Amplitude: {best_amp:.2f}% (TRADING)")
     return best_symbol
 
 async def auto_symbol_selection_task():
-    await send_telegram("🤖 Scanner Active - 8h Amplitude Based", silent=False)
+    await send_telegram("🤖 Scanner Active - 8h Amplitude Based (TRADING only)", silent=False)
     while True:
         now = datetime.now(timezone.utc)
         should_scan = now.minute >= 45 and now.hour % 8 == 7
@@ -376,18 +384,19 @@ async def auto_symbol_selection_task():
                         symbol_locked_until_candle.pop(new_symbol, None)
                         next_candle = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
                         symbol_tradeable_from_candle[new_symbol] = next_candle.timestamp()
+                        amp = 0.0
                         await send_telegram(f"🔄 New symbol: **{new_symbol}**", silent=False)
             await asyncio.sleep(8 * 3600 - 1800)
         else:
             await asyncio.sleep(30)
 
 # ────────────────────────────────────────────────
-# Trading Loop
+# Trading Loop with 5% Profit Lock
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Momentum + 5% Profit Lock (Per 8h Candle)")
-    await send_telegram("Bot started • 5% Profit Lock → Locked for current 8h candle", silent=False)
+    logger.info("Trading loop started - Momentum Entry + Safety Protection")
+    await send_telegram("Bot started • Momentum Entry + 5% Profit Lock (Per Candle)", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -396,7 +405,7 @@ async def trading_loop(_: Application) -> None:
 
         for symbol in list(monitored_symbols):
             try:
-                # Check lock
+                # Check if locked for current candle
                 current_candle_ts = get_current_candle_ts(datetime.now(timezone.utc))
                 if symbol in symbol_locked_until_candle and symbol_locked_until_candle[symbol] >= current_candle_ts:
                     continue
@@ -431,7 +440,7 @@ async def trading_loop(_: Application) -> None:
                 notional = qty * mark_price
                 profit_threshold = (PROFIT_LOCK_PCT / 100.0) * notional
 
-                # 5% Profit Lock + Lock for this candle
+                # === 5% PROFIT LOCK + LOCK FOR THIS CANDLE ===
                 if realized_pnl >= profit_threshold and current_side:
                     await close_position(symbol, f"{PROFIT_LOCK_PCT}% profit lock", 
                                        update_state=True, lock_for_candle=True, candle_ts=current_candle_open_ts)
@@ -453,13 +462,17 @@ async def trading_loop(_: Application) -> None:
 
                 # ENTRY
                 if current_side is None and not in_safety:
+                    if realized_pnl >= profit_threshold: continue
+
                     long_condition = sma[-2] > day_open
                     short_condition = sma[-2] < day_open
 
                     last_dir = symbol_last_direction.get(symbol)
                     if time_since_safety < SAFETY_COOLDOWN_SECONDS:
-                        if last_dir == "LONG" and long_condition: continue
-                        if last_dir == "SHORT" and short_condition: continue
+                        if last_dir == "LONG" and long_condition:
+                            continue
+                        if last_dir == "SHORT" and short_condition:
+                            continue
 
                     if long_condition:
                         resp = place_market_order(symbol, "BUY", qty)
@@ -513,7 +526,7 @@ async def trading_loop(_: Application) -> None:
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # ────────────────────────────────────────────────
-# Command Handlers
+# Command Handlers (Same as Original)
 # ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -536,14 +549,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = ["📊 **Bot Status**"]
     for sym in sorted(monitored_symbols):
         realized = symbol_realized_pnl_this_candle.get(sym, 0.0)
+        loss = symbol_cumulative_realized_loss.get(sym, 0.0)
         side = symbol_position_state.get(sym, "None")
-        locked = " 🔒 Locked" if sym in symbol_locked_until_candle else ""
-        lines.append(f"**{sym}** | Realized: {realized:.2f} | Pos: {side}{locked}")
+        locked = " 🔒Locked" if sym in symbol_locked_until_candle else ""
+        lines.append(f"**{sym}** | Realized: {realized:.2f} | Loss: {loss:.2f} | Pos: {side}{locked}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    for sym in list(monitored_symbols):
-        close_position(sym, "reset")
+    closed = [sym for sym in list(monitored_symbols) if close_position(sym, "reset")]
     monitored_symbols.clear()
     symbol_position_state.clear()
     symbol_entry_price.clear()
@@ -556,7 +569,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol_last_direction.clear()
     symbol_locked_until_candle.clear()
     configured.clear()
-    await update.message.reply_text("Full reset performed.")
+    text = "Full reset performed."
+    if closed:
+        text += f"\nClosed: {', '.join(closed)}"
+    await update.message.reply_text(text)
     await send_telegram("Bot reset")
 
 async def try_add_symbol(symbol: str, reply_func=None):
@@ -584,7 +600,7 @@ async def try_remove_symbol(symbol: str, reply_func=None):
     if symbol not in monitored_symbols:
         if reply_func: await reply_func(f"{symbol} not monitored")
         return
-    close_position(symbol, "remove")
+    closed = close_position(symbol, "remove")
     monitored_symbols.remove(symbol)
     symbol_position_state.pop(symbol, None)
     symbol_entry_price.pop(symbol, None)
@@ -652,7 +668,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("Bot starting with 5% Profit Lock + Per Candle Lock...")
+    print("Bot starting with 5% Profit Lock (Per 8h Candle) + Original TP Algo Order...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

@@ -50,10 +50,10 @@ FIXED_MARGIN_TYPE = "ISOLATED"
 CHECK_INTERVAL_SECONDS = 10
 POSITION_TOLERANCE = 1e-6
 
-BASE_TP_PCT = 5.0          # Starting TP
-OFFSET_PCT = 5.0           # Safety offset line from 8h candle open
-PROFIT_LOCK_PCT = 5.0      # Final realized PNL lock (no more new trades)
-MAX_DRAWDOWN_PCT = 2.0     # Unrealized drawdown protection
+BASE_TP_PCT = 5.0
+OFFSET_PCT = 5.0
+PROFIT_LOCK_PCT = 5.0
+MAX_DRAWDOWN_PCT = 2.0
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing one or more config values")
@@ -78,8 +78,8 @@ symbol_entry_price: Dict[str, Optional[float]] = {}
 symbol_last_exit_time: Dict[str, float] = {}
 symbol_candle_open_time: Dict[str, float] = {}
 symbol_tradeable_from_candle: Dict[str, float] = {}
-symbol_cumulative_realized_loss: Dict[str, float] = {}   # For dynamic TP
-symbol_realized_pnl_this_candle: Dict[str, float] = {}   # For 5% profit lock
+symbol_cumulative_realized_loss: Dict[str, float] = {}
+symbol_realized_pnl_this_candle: Dict[str, float] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 configured: Set[str] = set()
@@ -99,7 +99,8 @@ async def send_telegram(msg: str, silent: bool = True):
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
-    if params is None: params = {}
+    if params is None:
+        params = {}
     params["timestamp"] = int(time.time() * 1000)
     params["recvWindow"] = 5000
     qs = urlencode(sorted(params.items()))
@@ -126,7 +127,8 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
         return {"error": str(e)}
 
 def public_get(endpoint: str, params: Dict = None) -> list | dict:
-    if params is None: params = {}
+    if params is None:
+        params = {}
     try:
         r = requests.get(f"{BASE_URL}{endpoint}", params=params, timeout=10)
         r.raise_for_status()
@@ -208,7 +210,7 @@ def calculate_safe_quantity(symbol: str) -> float:
             break
     price = get_current_price(symbol)
     if price <= 0: return 0.0
-    target_usdt = min_notional * 1.1
+    target_usdt = min_notional * 10   # Increased size (adjust as needed)
     raw_qty = target_usdt / price
     steps = math.ceil(raw_qty / step_size)
     qty = max(steps * step_size, min_qty)
@@ -224,7 +226,6 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     return signed_request("POST", "/fapi/v1/order", params)
 
 def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
-    """Dynamic TP with minimum 5 decimal places using correct Algo Order parameters"""
     if side.upper() == "BUY":        # LONG → TP SELL
         tp_price = entry_price * (1 + tp_percent / 100.0)
         tp_side = "SELL"
@@ -232,29 +233,22 @@ def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_perce
         tp_price = entry_price * (1 - tp_percent / 100.0)
         tp_side = "BUY"
 
-    tp_price_str = f"{tp_price:.5f}"   # Minimum 5 decimal places
+    tp_price_str = f"{tp_price:.5f}"
 
     params = {
         "symbol": symbol,
         "side": tp_side,
         "type": "TAKE_PROFIT_MARKET",
         "quantity": f"{qty:.6f}".rstrip("0").rstrip("."),
-        "triggerPrice": tp_price_str,      # Mandatory parameter
+        "triggerPrice": tp_price_str,
         "stopPrice": tp_price_str,
         "reduceOnly": "true",
-        "algoType": "CONDITIONAL",
         "workingType": "MARK_PRICE",
         "priceProtect": "true"
     }
 
-    logger.info(f"Dynamic Algo TP {tp_percent:.1f}% placed on {symbol} | Trigger @ {tp_price_str}")
-    resp = signed_request("POST", "/fapi/v1/algoOrder", params)
-
-    if isinstance(resp, dict) and "algoId" in resp:
-        logger.info(f"Algo TP created successfully - algoId: {resp.get('algoId')}")
-    elif isinstance(resp, dict) and "code" in resp:
-        logger.error(f"Algo TP failed: {resp.get('code')} - {resp.get('msg')}")
-    return resp
+    logger.info(f"Dynamic TP {tp_percent:.1f}% on {symbol} @ {tp_price_str}")
+    return signed_request("POST", "/fapi/v1/order", params)
 
 def cancel_all_orders(symbol: str) -> bool:
     signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
@@ -285,7 +279,6 @@ def close_position(symbol: str, reason: str = "manual", update_state: bool = Tru
     return success
 
 def get_realized_pnl_this_candle(symbol: str, candle_open_ts: float) -> float:
-    """Fetch realized PNL from Binance"""
     start_time_ms = int(candle_open_ts * 1000)
     realized = 0.0
     income_data = signed_request("GET", "/fapi/v1/income", {
@@ -301,7 +294,7 @@ def get_realized_pnl_this_candle(symbol: str, candle_open_ts: float) -> float:
     return realized
 
 # ────────────────────────────────────────────────
-# 8h Candle & Auto Symbol Selection
+# 8h Candle & Symbol Selection (No Volume)
 # ────────────────────────────────────────────────
 
 def get_current_candle_ts(now: datetime) -> float:
@@ -326,18 +319,12 @@ async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
     target = get_current_candle_ts(now)
     best_symbol = None
     best_amp = -1.0
-    best_vol = 0.0
+
     for symbol in symbols:
         try:
             amp = get_candle_amplitude(symbol, target)
-            vol = 0.0
-            for k in get_klines(symbol, "8h", 20):
-                if abs(int(k[0])/1000 - target) < 300:
-                    vol = float(k[5])
-                    break
-            if amp > best_amp or (abs(amp - best_amp) < 0.1 and vol > best_vol * 1.1):
+            if amp > best_amp:
                 best_amp = amp
-                best_vol = vol
                 best_symbol = symbol
             await asyncio.sleep(0.08)
         except:
@@ -347,13 +334,14 @@ async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
     return best_symbol
 
 async def auto_symbol_selection_task():
-    await send_telegram("🤖 Scanner Active - 8h Volatility Based", silent=False)
+    await send_telegram("🤖 Scanner Active - 8h Amplitude Based", silent=False)
     while True:
         now = datetime.now(timezone.utc)
         should_scan = now.minute >= 45 and now.hour % 8 == 7
         if should_scan:
             new_symbol = await get_highest_volatility_symbol(now)
             if new_symbol:
+                # Close old symbols
                 for old in list(monitored_symbols):
                     if old != new_symbol:
                         close_position(old, "switching")
@@ -365,6 +353,7 @@ async def auto_symbol_selection_task():
                         symbol_tradeable_from_candle.pop(old, None)
                         symbol_cumulative_realized_loss.pop(old, None)
                         symbol_realized_pnl_this_candle.pop(old, None)
+                # Add new symbol
                 if new_symbol not in monitored_symbols:
                     if ensure_leverage_and_margin(new_symbol):
                         monitored_symbols.add(new_symbol)
@@ -382,12 +371,12 @@ async def auto_symbol_selection_task():
             await asyncio.sleep(30)
 
 # ────────────────────────────────────────────────
-# Trading Loop
+# Trading Loop - Updated with Crossover Logic
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Dynamic TP + 5% Final Realized PNL Lock")
-    await send_telegram("Bot started • Dynamic TP (loss recovery) + 5% Final Realized PNL Lock", silent=False)
+    logger.info("Trading loop started - Crossover Entry + Offset Crossover Exit")
+    await send_telegram("Bot started • Crossover Strategy + Dynamic TP + 5% Profit Lock", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -424,31 +413,32 @@ async def trading_loop(_: Application) -> None:
                 notional = qty * mark_price
                 profit_threshold = (PROFIT_LOCK_PCT / 100.0) * notional
 
-                # Final 5% Realized PNL Lock
+                # 5% Realized Profit Lock
                 if realized_pnl >= profit_threshold:
                     if current_side is not None:
-                        close_position(symbol, f"{PROFIT_LOCK_PCT}% final realized profit lock reached", update_state=True)
-                    logger.info(f"[{symbol}] {PROFIT_LOCK_PCT}% final realized profit reached → No more new trades this candle")
+                        close_position(symbol, f"{PROFIT_LOCK_PCT}% final realized profit lock", update_state=True)
                     continue
 
-                # Dynamic TP = 5% + previous losses
+                # Dynamic TP
                 current_loss = max(0.0, -realized_pnl)
                 symbol_cumulative_realized_loss[symbol] = current_loss
                 dynamic_tp = BASE_TP_PCT + (current_loss / notional * 100 if notional > 0 else 0)
 
-                # 1m SMA for entry signal
+                # 1m SMA for signals
                 klines_1m = get_klines(symbol, "1m", limit=30)
                 if len(klines_1m) < 10: continue
                 closes = [float(k[4]) for k in klines_1m]
-                sma_prev = sum(closes[-3:]) / 3
+                sma = [sum(closes[i-3:i]) / 3 for i in range(3, len(closes) + 1)]
+                if len(sma) < 3: continue
 
-                in_safety = (now_ts - symbol_last_exit_time.get(symbol, 0)) < 2
+                in_safety = (now_ts - symbol_last_exit_time.get(symbol, 0)) < 5
 
-                # ENTRY LOGIC
+                # ==================== ENTRY ====================
                 if current_side is None and not in_safety:
                     if realized_pnl >= profit_threshold: continue
 
-                    if sma_prev > day_open:
+                    # Long Entry: SMA crosses above 8h open
+                    if sma[-2] > day_open and sma[-3] < day_open:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "LONG"
@@ -456,7 +446,8 @@ async def trading_loop(_: Application) -> None:
                             await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | Dynamic TP: {dynamic_tp:.1f}%", silent=False)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
-                    elif sma_prev < day_open:
+                    # Short Entry: SMA crosses below 8h open
+                    elif sma[-2] < day_open and sma[-3] > day_open:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "SHORT"
@@ -464,7 +455,7 @@ async def trading_loop(_: Application) -> None:
                             await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} | Dynamic TP: {dynamic_tp:.1f}%", silent=False)
                             place_take_profit_order(symbol, "SELL", mark_price, dynamic_tp, qty)
 
-                # EXIT LOGIC
+                # ==================== EXIT ====================
                 elif current_side is not None:
                     pos = get_current_position_data(symbol)
                     unrealized = float(pos.get("unRealizedProfit", 0))
@@ -472,17 +463,24 @@ async def trading_loop(_: Application) -> None:
 
                     if unrealized_pct < -MAX_DRAWDOWN_PCT:
                         close_position(symbol, f"drawdown protection (-{MAX_DRAWDOWN_PCT}%)")
+                        continue
 
-                    elif current_side == "LONG" and sma_prev < (day_open * (1 + OFFSET_PCT / 100.0)):
-                        close_position(symbol, f"offset safety (+{OFFSET_PCT}%)", update_state=False)
-                        symbol_last_exit_time[symbol] = time.time()
+                    # Safety Offset Crossover Exit
+                    if current_side == "LONG":
+                        upper = day_open * (1 + OFFSET_PCT / 100.0)
+                        if sma[-2] < upper and sma[-3] > upper:
+                            close_position(symbol, f"offset safety crossed (+{OFFSET_PCT}%)", update_state=False)
+                            symbol_last_exit_time[symbol] = time.time()
 
-                    elif current_side == "SHORT" and sma_prev > (day_open * (1 - OFFSET_PCT / 100.0)):
-                        close_position(symbol, f"offset safety (-{OFFSET_PCT}%)", update_state=False)
-                        symbol_last_exit_time[symbol] = time.time()
+                    elif current_side == "SHORT":
+                        lower = day_open * (1 - OFFSET_PCT / 100.0)
+                        if sma[-2] > lower and sma[-3] < lower:
+                            close_position(symbol, f"offset safety crossed (-{OFFSET_PCT}%)", update_state=False)
+                            symbol_last_exit_time[symbol] = time.time()
 
-                    elif (current_side == "LONG" and sma_prev < day_open) or \
-                         (current_side == "SHORT" and sma_prev > day_open):
+                    # SMA crossed back through open price
+                    elif (current_side == "LONG" and sma[-2] < day_open and sma[-3] > day_open) or \
+                         (current_side == "SHORT" and sma[-2] > day_open and sma[-3] < day_open):
                         close_position(symbol, "SMA crossed open price")
 
             except Exception as e:
@@ -516,7 +514,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         realized = symbol_realized_pnl_this_candle.get(sym, 0.0)
         loss = symbol_cumulative_realized_loss.get(sym, 0.0)
         side = symbol_position_state.get(sym, "None")
-        lines.append(f"**{sym}** | Realized PNL: {realized:.2f} | Loss: {loss:.2f} | Position: {side}")
+        lines.append(f"**{sym}** | Realized: {realized:.2f} | Loss: {loss:.2f} | Pos: {side}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -623,7 +621,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("Bot starting with Dynamic TP (5% base + loss recovery) + 5% Final Realized PNL Lock...")
+    print("Bot starting with Crossover Strategy...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

@@ -438,7 +438,7 @@ async def trading_loop(_: Application) -> None:
                     if realized_pnl >= profit_threshold: continue
 
                     # Long Entry: SMA crosses above 8h open
-                    if sma[-2] > day_open and sma[-3] < day_open:
+                    if sma[-2] > day_open: # and sma[-3] < day_open:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "LONG"
@@ -447,7 +447,7 @@ async def trading_loop(_: Application) -> None:
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
                     # Short Entry: SMA crosses below 8h open
-                    elif sma[-2] < day_open and sma[-3] > day_open:
+                    elif sma[-2] < day_open: # and sma[-3] > day_open:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "SHORT"

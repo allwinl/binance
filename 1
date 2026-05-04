@@ -99,8 +99,7 @@ async def send_telegram(msg: str, silent: bool = True):
 # ────────────────────────────────────────────────
 
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
-    if params is None:
-        params = {}
+    if params is None: params = {}
     params["timestamp"] = int(time.time() * 1000)
     params["recvWindow"] = 5000
     qs = urlencode(sorted(params.items()))
@@ -224,8 +223,19 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     logger.info(f"ORDER {side.upper()} {qstr} {symbol}")
     return signed_request("POST", "/fapi/v1/order", params)
 
+def get_price_precision(symbol: str) -> int:
+    """Get correct price decimal places"""
+    data = public_get("/fapi/v1/exchangeInfo")
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick_size = float(f["tickSize"])
+                    return -int(math.log10(tick_size))
+    return 2  # default for BTCUSDT
+
 def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
-    """Fixed version using Algo Order API"""
+    """Fixed with proper precision"""
     if side.upper() == "BUY":        # LONG → TP SELL
         tp_price = entry_price * (1 + tp_percent / 100.0)
         tp_side = "SELL"
@@ -233,7 +243,8 @@ def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_perce
         tp_price = entry_price * (1 - tp_percent / 100.0)
         tp_side = "BUY"
 
-    tp_price_str = f"{tp_price:.5f}"
+    precision = get_price_precision(symbol)
+    tp_price_str = f"{tp_price:.{precision}f}"
 
     params = {
         "symbol": symbol,
@@ -248,11 +259,11 @@ def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_perce
         "algoType": "CONDITIONAL"
     }
 
-    logger.info(f"Dynamic TP {tp_percent:.1f}% on {symbol} | Trigger @ {tp_price_str}")
+    logger.info(f"Dynamic TP {tp_percent:.1f}% on {symbol} | Trigger @ {tp_price_str} ({precision} decimals)")
     resp = signed_request("POST", "/fapi/v1/algoOrder", params)
 
     if isinstance(resp, dict) and "algoId" in resp:
-        logger.info(f"✅ Algo TP placed - algoId: {resp.get('algoId')}")
+        logger.info(f"✅ Algo TP placed successfully - algoId: {resp.get('algoId')}")
     else:
         logger.error(f"❌ Algo TP failed: {resp}")
     return resp
@@ -301,7 +312,7 @@ def get_realized_pnl_this_candle(symbol: str, candle_open_ts: float) -> float:
     return realized
 
 # ────────────────────────────────────────────────
-# 8h Candle & Symbol Selection
+# 8h Candle Logic & Auto Selection
 # ────────────────────────────────────────────────
 
 def get_current_candle_ts(now: datetime) -> float:
@@ -380,8 +391,8 @@ async def auto_symbol_selection_task():
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Crossover + Fixed Algo TP")
-    await send_telegram("Bot started • Crossover Strategy + Dynamic TP", silent=False)
+    logger.info("Trading loop started - Fixed Precision TP")
+    await send_telegram("Bot started • Crossover + Dynamic TP (Fixed)", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -438,7 +449,7 @@ async def trading_loop(_: Application) -> None:
                 if current_side is None and not in_safety:
                     if realized_pnl >= profit_threshold: continue
 
-                    if sma[-2] > day_open: # and sma[-3] < day_open:   # Long crossover
+                    if sma[-2] > day_open: # and sma[-3] < day_open:   # Long
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "LONG"
@@ -446,7 +457,7 @@ async def trading_loop(_: Application) -> None:
                             await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
-                    elif sma[-2] < day_open: # and sma[-3] > day_open:  # Short crossover
+                    elif sma[-2] < day_open: # and sma[-3] > day_open:  # Short
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "SHORT"
@@ -464,7 +475,6 @@ async def trading_loop(_: Application) -> None:
                         close_position(symbol, f"drawdown protection (-{MAX_DRAWDOWN_PCT}%)")
                         continue
 
-                    # Safety Offset Crossover Exit
                     if current_side == "LONG":
                         upper = day_open * (1 + OFFSET_PCT / 100.0)
                         if sma[-2] < upper and sma[-3] > upper:
@@ -484,10 +494,7 @@ async def trading_loop(_: Application) -> None:
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-# ────────────────────────────────────────────────
-# Command Handlers
-# ────────────────────────────────────────────────
-
+# Command Handlers (same as previous version)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Dynamic TP Bot\nCommands: /add /rem /list /status /reset")
 
@@ -617,7 +624,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("Bot starting with Fixed Algo TP + 60s Safety Cooldown...")
+    print("Bot starting with Dynamic TP + Proper Price Precision...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

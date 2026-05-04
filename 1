@@ -54,6 +54,7 @@ BASE_TP_PCT = 5.0
 OFFSET_PCT = 5.0
 PROFIT_LOCK_PCT = 5.0
 MAX_DRAWDOWN_PCT = 2.0
+SAFETY_COOLDOWN_SECONDS = 60  # 5 minutes cooldown after safety exit
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing one or more config values")
@@ -76,10 +77,12 @@ monitored_symbols: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}
 symbol_entry_price: Dict[str, Optional[float]] = {}
 symbol_last_exit_time: Dict[str, float] = {}
+symbol_last_safety_exit_time: Dict[str, float] = {}
 symbol_candle_open_time: Dict[str, float] = {}
 symbol_tradeable_from_candle: Dict[str, float] = {}
 symbol_cumulative_realized_loss: Dict[str, float] = {}
 symbol_realized_pnl_this_candle: Dict[str, float] = {}
+symbol_last_direction: Dict[str, Optional[str]] = {}   # Track last direction after safety exit
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 configured: Set[str] = set()
@@ -112,8 +115,6 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
             r = requests.post(url, headers=HEADERS, timeout=10)
         elif method.upper() == "DELETE":
             r = requests.delete(url, headers=HEADERS, timeout=10)
-        else:
-            raise ValueError("Bad method")
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and "code" in data and data["code"] < 0:
@@ -141,6 +142,16 @@ def get_all_perp_symbols() -> List[str]:
             if s.get("contractType") == "PERPETUAL" 
             and s.get("status") == "TRADING" 
             and s.get("quoteAsset") == "USDT"]
+
+def get_price_precision(symbol: str) -> int:
+    data = public_get("/fapi/v1/exchangeInfo")
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick_size = float(f.get("tickSize", 0.01))
+                    return -int(math.log10(tick_size))
+    return 2
 
 def ensure_leverage_and_margin(symbol: str) -> bool:
     if symbol in configured:
@@ -223,23 +234,11 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     logger.info(f"ORDER {side.upper()} {qstr} {symbol}")
     return signed_request("POST", "/fapi/v1/order", params)
 
-def get_price_precision(symbol: str) -> int:
-    """Get correct price decimal places"""
-    data = public_get("/fapi/v1/exchangeInfo")
-    for s in data.get("symbols", []):
-        if s["symbol"] == symbol:
-            for f in s.get("filters", []):
-                if f["filterType"] == "PRICE_FILTER":
-                    tick_size = float(f["tickSize"])
-                    return -int(math.log10(tick_size))
-    return 2  # default for BTCUSDT
-
 def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
-    """Fixed with proper precision"""
-    if side.upper() == "BUY":        # LONG → TP SELL
+    if side.upper() == "BUY":
         tp_price = entry_price * (1 + tp_percent / 100.0)
         tp_side = "SELL"
-    else:                            # SHORT → TP BUY
+    else:
         tp_price = entry_price * (1 - tp_percent / 100.0)
         tp_side = "BUY"
 
@@ -259,13 +258,13 @@ def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_perce
         "algoType": "CONDITIONAL"
     }
 
-    logger.info(f"Dynamic TP {tp_percent:.1f}% on {symbol} | Trigger @ {tp_price_str} ({precision} decimals)")
+    logger.info(f"Dynamic TP {tp_percent:.1f}% on {symbol} | Trigger @ {tp_price_str}")
     resp = signed_request("POST", "/fapi/v1/algoOrder", params)
 
     if isinstance(resp, dict) and "algoId" in resp:
-        logger.info(f"✅ Algo TP placed successfully - algoId: {resp.get('algoId')}")
+        logger.info(f"✅ TP placed - algoId: {resp.get('algoId')}")
     else:
-        logger.error(f"❌ Algo TP failed: {resp}")
+        logger.error(f"❌ TP failed: {resp}")
     return resp
 
 def cancel_all_orders(symbol: str) -> bool:
@@ -312,7 +311,7 @@ def get_realized_pnl_this_candle(symbol: str, candle_open_ts: float) -> float:
     return realized
 
 # ────────────────────────────────────────────────
-# 8h Candle Logic & Auto Selection
+# 8h Candle & Symbol Selection
 # ────────────────────────────────────────────────
 
 def get_current_candle_ts(now: datetime) -> float:
@@ -366,18 +365,22 @@ async def auto_symbol_selection_task():
                         symbol_position_state.pop(old, None)
                         symbol_entry_price.pop(old, None)
                         symbol_last_exit_time.pop(old, None)
+                        symbol_last_safety_exit_time.pop(old, None)
                         symbol_candle_open_time.pop(old, None)
                         symbol_tradeable_from_candle.pop(old, None)
                         symbol_cumulative_realized_loss.pop(old, None)
                         symbol_realized_pnl_this_candle.pop(old, None)
+                        symbol_last_direction.pop(old, None)
                 if new_symbol not in monitored_symbols:
                     if ensure_leverage_and_margin(new_symbol):
                         monitored_symbols.add(new_symbol)
                         symbol_position_state[new_symbol] = None
                         symbol_last_exit_time[new_symbol] = 0
+                        symbol_last_safety_exit_time[new_symbol] = 0
                         symbol_candle_open_time[new_symbol] = 0
                         symbol_cumulative_realized_loss[new_symbol] = 0.0
                         symbol_realized_pnl_this_candle[new_symbol] = 0.0
+                        symbol_last_direction[new_symbol] = None
                         next_candle = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
                         symbol_tradeable_from_candle[new_symbol] = next_candle.timestamp()
                         amp = get_candle_amplitude(new_symbol, get_current_candle_ts(now))
@@ -391,8 +394,8 @@ async def auto_symbol_selection_task():
 # ────────────────────────────────────────────────
 
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Fixed Precision TP")
-    await send_telegram("Bot started • Crossover + Dynamic TP (Fixed)", silent=False)
+    logger.info("Trading loop started - Simple Momentum Entry + Anti-Whipsaw Protection")
+    await send_telegram("Bot started • Simple Momentum Entry + Safety Protection", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -417,6 +420,7 @@ async def trading_loop(_: Application) -> None:
                     symbol_candle_open_time[symbol] = current_candle_open_ts
                     symbol_cumulative_realized_loss[symbol] = 0.0
                     symbol_realized_pnl_this_candle[symbol] = 0.0
+                    symbol_last_direction[symbol] = None
 
                 now_ts = time.time()
                 if now_ts - current_candle_open_ts < 60: continue
@@ -443,29 +447,43 @@ async def trading_loop(_: Application) -> None:
                 if len(sma) < 3: continue
 
                 time_since_last_exit = now_ts - symbol_last_exit_time.get(symbol, 0)
-                in_safety = time_since_last_exit < 60
+                time_since_safety = now_ts - symbol_last_safety_exit_time.get(symbol, 0)
+                in_safety = time_since_last_exit < SAFETY_COOLDOWN_SECONDS
 
-                # ENTRY
+                # ==================== ENTRY ====================
                 if current_side is None and not in_safety:
                     if realized_pnl >= profit_threshold: continue
 
-                    if sma[-2] > day_open and sma[-3] < day_open:   # Long
+                    long_condition = sma[-2] > day_open
+                    short_condition = sma[-2] < day_open
+
+                    # Anti-Whipsaw: Prevent same direction re-entry after safety exit
+                    last_dir = symbol_last_direction.get(symbol)
+                    if time_since_safety < SAFETY_COOLDOWN_SECONDS:
+                        if last_dir == "LONG" and long_condition:
+                            continue
+                        if last_dir == "SHORT" and short_condition:
+                            continue
+
+                    if long_condition:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
+                            symbol_last_direction[symbol] = "LONG"
                             await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
-                    elif sma[-2] < day_open and sma[-3] > day_open:  # Short
+                    elif short_condition:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
+                            symbol_last_direction[symbol] = "SHORT"
                             await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
                             place_take_profit_order(symbol, "SELL", mark_price, dynamic_tp, qty)
 
-                # EXIT
+                # ==================== EXIT ====================
                 elif current_side is not None:
                     pos = get_current_position_data(symbol)
                     unrealized = float(pos.get("unRealizedProfit", 0))
@@ -475,11 +493,14 @@ async def trading_loop(_: Application) -> None:
                         close_position(symbol, f"drawdown protection (-{MAX_DRAWDOWN_PCT}%)")
                         continue
 
+                    # Safety Offset Exit
                     if current_side == "LONG":
                         upper = day_open * (1 + OFFSET_PCT / 100.0)
                         if sma[-2] < upper and sma[-3] > upper:
                             close_position(symbol, f"offset safety crossed (+{OFFSET_PCT}%)", update_state=False)
                             symbol_last_exit_time[symbol] = time.time()
+                            symbol_last_safety_exit_time[symbol] = time.time()
+                            symbol_last_direction[symbol] = "LONG"
                             continue
 
                     elif current_side == "SHORT":
@@ -487,6 +508,8 @@ async def trading_loop(_: Application) -> None:
                         if sma[-2] > lower and sma[-3] < lower:
                             close_position(symbol, f"offset safety crossed (-{OFFSET_PCT}%)", update_state=False)
                             symbol_last_exit_time[symbol] = time.time()
+                            symbol_last_safety_exit_time[symbol] = time.time()
+                            symbol_last_direction[symbol] = "SHORT"
                             continue
 
             except Exception as e:
@@ -494,7 +517,10 @@ async def trading_loop(_: Application) -> None:
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-# Command Handlers (same as previous version)
+# ────────────────────────────────────────────────
+# Command Handlers
+# ────────────────────────────────────────────────
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Dynamic TP Bot\nCommands: /add /rem /list /status /reset")
 
@@ -526,10 +552,12 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol_position_state.clear()
     symbol_entry_price.clear()
     symbol_last_exit_time.clear()
+    symbol_last_safety_exit_time.clear()
     symbol_candle_open_time.clear()
     symbol_tradeable_from_candle.clear()
     symbol_cumulative_realized_loss.clear()
     symbol_realized_pnl_this_candle.clear()
+    symbol_last_direction.clear()
     configured.clear()
     text = "Full reset performed."
     if closed:
@@ -549,9 +577,11 @@ async def try_add_symbol(symbol: str, reply_func=None):
         monitored_symbols.add(symbol)
         symbol_position_state[symbol] = None
         symbol_last_exit_time[symbol] = 0
+        symbol_last_safety_exit_time[symbol] = 0
         symbol_candle_open_time[symbol] = 0
         symbol_cumulative_realized_loss[symbol] = 0.0
         symbol_realized_pnl_this_candle[symbol] = 0.0
+        symbol_last_direction[symbol] = None
         if reply_func: await reply_func(f"Added {symbol}")
 
 async def try_remove_symbol(symbol: str, reply_func=None):
@@ -564,10 +594,12 @@ async def try_remove_symbol(symbol: str, reply_func=None):
     symbol_position_state.pop(symbol, None)
     symbol_entry_price.pop(symbol, None)
     symbol_last_exit_time.pop(symbol, None)
+    symbol_last_safety_exit_time.pop(symbol, None)
     symbol_candle_open_time.pop(symbol, None)
     symbol_tradeable_from_candle.pop(symbol, None)
     symbol_cumulative_realized_loss.pop(symbol, None)
     symbol_realized_pnl_this_candle.pop(symbol, None)
+    symbol_last_direction.pop(symbol, None)
     configured.discard(symbol)
     if reply_func: await reply_func(f"Removed {symbol}")
 
@@ -624,7 +656,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("Bot starting with Dynamic TP + Proper Price Precision...")
+    print("Bot starting with Momentum Entry + Anti-Whipsaw Protection...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

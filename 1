@@ -197,7 +197,7 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     return signed_request("POST", "/fapi/v1/order", params)
 
 # ────────────────────────────────────────────────
-# FIXED TAKE PROFIT FUNCTION
+# FIXED TAKE PROFIT FUNCTION (Improved)
 # ────────────────────────────────────────────────
 def place_take_profit_order(symbol: str, entry_side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
     if entry_side.upper() == "BUY":      # Long
@@ -209,15 +209,22 @@ def place_take_profit_order(symbol: str, entry_side: str, entry_price: float, tp
 
     precision = get_price_precision(symbol)
     current_price = get_current_price(symbol)
+    if current_price <= 0:
+        current_price = entry_price
 
-    # Avoid "Order would immediately trigger" error
-    min_distance = 0.35
-    if tp_side == "SELL" and tp_price <= current_price * (1 + min_distance / 100):
-        tp_price = current_price * (1 + min_distance / 100)
-        logger.warning(f"TP adjusted upward for {symbol}")
-    elif tp_side == "BUY" and tp_price >= current_price * (1 - min_distance / 100):
-        tp_price = current_price * (1 - min_distance / 100)
-        logger.warning(f"TP adjusted downward for {symbol}")
+    # Minimum distance to avoid "Order would immediately trigger"
+    min_distance_pct = 0.5
+
+    if tp_side == "SELL":   # Long TP
+        min_tp = current_price * (1 + min_distance_pct / 100.0)
+        if tp_price < min_tp:
+            tp_price = min_tp
+            logger.warning(f"TP adjusted upward for {symbol}")
+    else:                   # Short TP
+        max_tp = current_price * (1 - min_distance_pct / 100.0)
+        if tp_price > max_tp:
+            tp_price = max_tp
+            logger.warning(f"TP adjusted downward for {symbol}")
 
     tp_price_str = f"{tp_price:.{precision}f}"
 
@@ -232,17 +239,38 @@ def place_take_profit_order(symbol: str, entry_side: str, entry_price: float, tp
         "priceProtect": "true"
     }
 
-    logger.info(f"TP → {tp_side} {symbol} @ {tp_price_str} ({tp_percent}% from {entry_price:.2f})")
+    logger.info(f"TP → {tp_side} {symbol} @ {tp_price_str} ({tp_percent}% from {entry_price:.2f} | Current: {current_price:.2f})")
+
     response = signed_request("POST", "/fapi/v1/order", params)
 
     if isinstance(response, dict) and response.get("code", 0) < 0:
-        logger.error(f"TP Failed: {response.get('msg')} (Code: {response.get('code')})")
-        if response.get("code") in (-2021, -2010, -2011):
+        error_code = response.get("code")
+        error_msg = response.get("msg", "")
+
+        logger.error(f"TP Failed: {error_msg} (Code: {error_code})")
+
+        if error_code in (-2021, -2010, -2011):
+            # Retry without priceProtect
             params.pop("priceProtect", None)
-            logger.info("Retrying without priceProtect...")
+            logger.info("Retrying TP without priceProtect...")
             response = signed_request("POST", "/fapi/v1/order", params)
 
+        # Fallback using closePosition (very reliable)
+        if error_code in (-2021, -2010, -2011, -2022):
+            logger.info("Trying closePosition fallback...")
+            fallback_params = {
+                "symbol": symbol,
+                "side": tp_side,
+                "type": "TAKE_PROFIT_MARKET",
+                "closePosition": "true",
+                "stopPrice": tp_price_str,
+                "reduceOnly": "true",
+                "workingType": "MARK_PRICE"
+            }
+            response = signed_request("POST", "/fapi/v1/order", fallback_params)
+
     return response
+
 
 def cancel_all_orders(symbol: str):
     signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
@@ -257,7 +285,7 @@ def close_position(symbol: str, reason: str = "manual", update_state: bool = Tru
         return True
 
     cancel_all_orders(symbol)
-    time.sleep(0.25)  # Small delay
+    time.sleep(0.25)
 
     side = "SELL" if amt > 0 else "BUY"
     qty = abs(amt)
@@ -370,7 +398,7 @@ def get_current_candle_ts(now: datetime) -> float:
     return current_candle.timestamp()
 
 # ────────────────────────────────────────────────
-# Auto Symbol Selection
+# Auto Symbol Selection & Trading Loop (unchanged except small improvement)
 # ────────────────────────────────────────────────
 async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
     all_symbols = get_all_perp_symbols()
@@ -434,9 +462,6 @@ async def auto_symbol_selection_task():
         else:
             await asyncio.sleep(30)
 
-# ────────────────────────────────────────────────
-# Trading Loop
-# ────────────────────────────────────────────────
 async def trading_loop(_: Application) -> None:
     logger.info("Trading loop started - Momentum + Offset Exit")
     await send_telegram("Bot started • Momentum Entry + Offset Exit + 5% Profit Lock", silent=False)
@@ -510,6 +535,8 @@ async def trading_loop(_: Application) -> None:
                     if long_condition:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
+                            await asyncio.sleep(0.4)          # ← Small delay
+                            sync_position_state(symbol)
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
                             symbol_last_direction[symbol] = "LONG"
@@ -519,6 +546,8 @@ async def trading_loop(_: Application) -> None:
                     elif short_condition:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
+                            await asyncio.sleep(0.4)
+                            sync_position_state(symbol)
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
                             symbol_last_direction[symbol] = "SHORT"
@@ -548,9 +577,7 @@ async def trading_loop(_: Application) -> None:
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-# ────────────────────────────────────────────────
-# Command Handlers
-# ────────────────────────────────────────────────
+# Command Handlers (unchanged)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Dynamic TP Bot\nCommands: /add /rem /list /status /reset")
 
@@ -576,6 +603,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"**{sym}** | Realized: {realized:.2f} | Pos: {side}{locked}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+# ... (try_add_symbol, try_remove_symbol, cmd_add, cmd_rem, cmd_reset remain the same)
 async def try_add_symbol(symbol: str, reply_func=None):
     symbol = symbol.strip().upper()
     if not symbol.endswith("USDT") or symbol not in get_all_perp_symbols():

@@ -231,7 +231,7 @@ def place_take_profit_order(symbol: str, entry_side: str, entry_price: float, tp
     params = {
         "symbol": symbol,
         "side": tp_side,
-        "type": "TAKE_PROFIT_MARKET",
+        "strategyType": "TAKE_PROFIT_MARKET",
         "quantity": f"{qty:.6f}".rstrip("0").rstrip("."),
         "stopPrice": tp_price_str,
         "reduceOnly": "true",

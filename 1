@@ -55,7 +55,7 @@ PROFIT_LOCK_PCT = 5.0
 MAX_DRAWDOWN_PCT = 2.0
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    print("ERROR: Missing one or more config values")
+    print("ERROR: Missing config values")
     exit(1)
 
 HEADERS = {"X-MBX-APIKEY": API_KEY}
@@ -68,7 +68,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────
-# State
+# State & Caches
 # ────────────────────────────────────────────────
 monitored_symbols: Set[str] = set()
 symbol_position_state: Dict[str, Optional[str]] = {}
@@ -78,6 +78,9 @@ symbol_candle_open_time: Dict[str, float] = {}
 symbol_tradeable_from_candle: Dict[str, float] = {}
 symbol_cumulative_realized_loss: Dict[str, float] = {}
 symbol_realized_pnl_this_candle: Dict[str, float] = {}
+
+_price_precision_cache: Dict[str, int] = {}
+_qty_step_cache: Dict[str, float] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 configured: Set[str] = set()
@@ -108,8 +111,6 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
             r = requests.post(url, headers=HEADERS, timeout=10)
         elif method.upper() == "DELETE":
             r = requests.delete(url, headers=HEADERS, timeout=10)
-        else:
-            return {"error": "Invalid method"}
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and "code" in data and data["code"] < 0:
@@ -130,6 +131,35 @@ def public_get(endpoint: str, params: Dict = None):
     except Exception as e:
         logger.error(f"Public GET failed {endpoint}: {e}")
         return {}
+
+def get_price_precision(symbol: str) -> int:
+    if symbol in _price_precision_cache:
+        return _price_precision_cache[symbol]
+    data = public_get("/fapi/v1/exchangeInfo")
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = float(f.get("tickSize", "0.0001"))
+                    prec = max(0, -int(math.log10(tick))) if tick > 0 else 4
+                    _price_precision_cache[symbol] = prec
+                    return prec
+    _price_precision_cache[symbol] = 4
+    return 4
+
+def get_qty_step(symbol: str) -> float:
+    if symbol in _qty_step_cache:
+        return _qty_step_cache[symbol]
+    data = public_get("/fapi/v1/exchangeInfo")
+    for s in data.get("symbols", []):
+        if s["symbol"] == symbol:
+            for f in s.get("filters", []):
+                if f["filterType"] == "LOT_SIZE":
+                    step = float(f.get("stepSize", 0.001))
+                    _qty_step_cache[symbol] = step
+                    return step
+    _qty_step_cache[symbol] = 0.001
+    return 0.001
 
 def get_all_perp_symbols() -> List[str]:
     data = public_get("/fapi/v1/exchangeInfo")
@@ -191,9 +221,12 @@ def get_klines(symbol: str, interval: str, limit: int = 200) -> list:
 def calculate_safe_quantity(symbol: str) -> float:
     price = get_current_price(symbol)
     if price <= 0: return 0.0
-    target_usdt = 15.0  # You can adjust this
+    step_size = get_qty_step(symbol)
+    target_usdt = 12.0
     raw_qty = target_usdt / price
-    return round(raw_qty, 6)
+    steps = math.ceil(raw_qty / step_size)
+    qty = max(steps * step_size, step_size)
+    return round(qty, 6)
 
 def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False) -> dict:
     if qty <= 0: return {"error": "Invalid qty"}
@@ -205,11 +238,14 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     return signed_request("POST", "/fapi/v1/order", params)
 
 # ────────────────────────────────────────────────
-# FIXED TAKE PROFIT ORDER
+# TAKE PROFIT - LIMIT ORDER (Fixed Precision)
 # ────────────────────────────────────────────────
 def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
-    """Corrected TAKE_PROFIT_MARKET using algoOrder"""
-    
+    if qty <= 0 or entry_price <= 0:
+        return {"error": "Invalid params"}
+
+    price_prec = get_price_precision(symbol)
+
     if side.upper() == "BUY":        # LONG → TP SELL
         tp_side = "SELL"
         tp_price = entry_price * (1 + tp_percent / 100.0)
@@ -217,52 +253,31 @@ def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_perce
         tp_side = "BUY"
         tp_price = entry_price * (1 - tp_percent / 100.0)
 
-    current_price = get_current_price(symbol) or entry_price
-
-    # Safety buffer to avoid immediate trigger
-    min_distance_pct = 0.5
-    if tp_side == "SELL":
-        min_allowed = current_price * (1 + min_distance_pct / 100.0)
-        if tp_price < min_allowed:
-            tp_price = min_allowed
-    else:
-        max_allowed = current_price * (1 - min_distance_pct / 100.0)
-        if tp_price > max_allowed:
-            tp_price = max_allowed
-
-    precision = 2 if "BTC" in symbol.upper() else 4 if "ETH" in symbol.upper() else 5
-    tp_price_str = f"{tp_price:.{precision}f}"
+    tp_str = f"{tp_price:.{price_prec}f}".rstrip("0").rstrip(".")
+    qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
 
     params = {
         "symbol": symbol,
         "side": tp_side,
-        "type": "TAKE_PROFIT_MARKET",
-        "quantity": f"{qty:.6f}".rstrip("0").rstrip("."),
-        "stopPrice": tp_price_str,
-        "workingType": "MARK_PRICE",
-        "reduceOnly": "true",
-        "priceProtect": "true",
-        "algoType": "CONDITIONAL",      # ← This was missing
+        "type": "LIMIT",
+        "quantity": qstr,
+        "price": tp_str,
         "timeInForce": "GTC",
+        "reduceOnly": "true",
     }
 
-    logger.info(f"ALGO TP → {tp_side} {symbol} @ {tp_price_str} ({tp_percent:.1f}%)")
+    logger.info(f"TP LIMIT {tp_side} {symbol} @ {tp_str} ({tp_percent:.1f}%)")
+    response = signed_request("POST", "/fapi/v1/order", params)
 
-    response = signed_request("POST", "/fapi/v1/algoOrder", params)
-
-    if isinstance(response, dict):
-        if "algoId" in response:
-            logger.info(f"✅ TP Success - algoId: {response.get('algoId')}")
-            return response
-        else:
-            logger.error(f"❌ TP Failed: {response.get('code')} - {response.get('msg')}")
-            logger.error(f"Response: {response}")
+    if isinstance(response, dict) and response.get("orderId"):
+        logger.info(f"✅ TP Order Placed - Order ID: {response.get('orderId')}")
+    else:
+        logger.error(f"❌ TP Failed: {response.get('msg', response)}")
     return response
 
 
 def cancel_all_orders(symbol: str):
     signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
-    signed_request("DELETE", "/fapi/v1/algo/allOpenOrders", {"symbol": symbol})
     time.sleep(0.4)
 
 def close_position(symbol: str, reason: str = "manual", update_state: bool = True) -> bool:
@@ -331,20 +346,13 @@ async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
     target = get_current_candle_ts(now)
     best_symbol = None
     best_amp = -1.0
-    best_vol = 0.0
     for symbol in symbols:
         try:
             amp = get_candle_amplitude(symbol, target)
-            vol = 0.0
-            for k in get_klines(symbol, "8h", 20):
-                if abs(int(k[0])/1000 - target) < 300:
-                    vol = float(k[5])
-                    break
-            if amp > best_amp or (abs(amp - best_amp) < 0.1 and vol > best_vol * 1.1):
+            if amp > best_amp:
                 best_amp = amp
-                best_vol = vol
                 best_symbol = symbol
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.06)
         except:
             continue
     if best_symbol:
@@ -387,8 +395,8 @@ async def auto_symbol_selection_task():
 # Trading Loop
 # ────────────────────────────────────────────────
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Fixed Dynamic TP")
-    await send_telegram("Bot started • Fixed Algo TP", silent=False)
+    logger.info("Trading loop started - Fixed LIMIT Take Profit")
+    await send_telegram("Bot started • Fixed LIMIT TP + Dynamic Logic", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -425,7 +433,7 @@ async def trading_loop(_: Application) -> None:
                 profit_threshold = (PROFIT_LOCK_PCT / 100.0) * notional
 
                 if realized_pnl >= profit_threshold and current_side is not None:
-                    close_position(symbol, f"{PROFIT_LOCK_PCT}% final realized profit lock")
+                    close_position(symbol, f"{PROFIT_LOCK_PCT}% profit lock")
                     continue
 
                 current_loss = max(0.0, -realized_pnl)
@@ -447,7 +455,7 @@ async def trading_loop(_: Application) -> None:
                             sync_position_state(symbol)
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
-                            await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | Dynamic TP: {dynamic_tp:.1f}%", silent=False)
+                            await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
                             cancel_all_orders(symbol)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
@@ -458,7 +466,7 @@ async def trading_loop(_: Application) -> None:
                             sync_position_state(symbol)
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
-                            await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} | Dynamic TP: {dynamic_tp:.1f}%", silent=False)
+                            await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
                             cancel_all_orders(symbol)
                             place_take_profit_order(symbol, "SELL", mark_price, dynamic_tp, qty)
 
@@ -615,7 +623,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("🚀 Bot Started with FIXED ALGO TAKE_PROFIT_MARKET")
+    print("🚀 Bot Started with FIXED LIMIT Take Profit")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

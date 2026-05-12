@@ -108,6 +108,8 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
             r = requests.post(url, headers=HEADERS, timeout=10)
         elif method.upper() == "DELETE":
             r = requests.delete(url, headers=HEADERS, timeout=10)
+        else:
+            return {"error": "Invalid method"}
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and "code" in data and data["code"] < 0:
@@ -187,26 +189,11 @@ def get_klines(symbol: str, interval: str, limit: int = 200) -> list:
         return []
 
 def calculate_safe_quantity(symbol: str) -> float:
-    data = public_get("/fapi/v1/exchangeInfo")
-    min_notional = 5.0
-    step_size = 0.001
-    min_qty = 0.001
-    for s in data.get("symbols", []):
-        if s["symbol"] == symbol:
-            for f in s.get("filters", []):
-                if f["filterType"] == "LOT_SIZE":
-                    min_qty = float(f["minQty"])
-                    step_size = float(f["stepSize"])
-                if f["filterType"] == "MIN_NOTIONAL":
-                    min_notional = float(f.get("notional", 5.0))
-            break
     price = get_current_price(symbol)
     if price <= 0: return 0.0
-    target_usdt = min_notional * 1.1
+    target_usdt = 15.0  # You can adjust this
     raw_qty = target_usdt / price
-    steps = math.ceil(raw_qty / step_size)
-    qty = max(steps * step_size, min_qty)
-    return round(qty, 6)
+    return round(raw_qty, 6)
 
 def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = False) -> dict:
     if qty <= 0: return {"error": "Invalid qty"}
@@ -218,37 +205,32 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     return signed_request("POST", "/fapi/v1/order", params)
 
 # ────────────────────────────────────────────────
-# FIXED TAKE PROFIT - Using Algo Order API (Required)
+# FIXED TAKE PROFIT ORDER
 # ────────────────────────────────────────────────
 def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
-    """Correct Algo Order for TAKE_PROFIT_MARKET"""
+    """Corrected TAKE_PROFIT_MARKET using algoOrder"""
     
     if side.upper() == "BUY":        # LONG → TP SELL
-        tp_price = entry_price * (1 + tp_percent / 100.0)
         tp_side = "SELL"
+        tp_price = entry_price * (1 + tp_percent / 100.0)
     else:                            # SHORT → TP BUY
-        tp_price = entry_price * (1 - tp_percent / 100.0)
         tp_side = "BUY"
+        tp_price = entry_price * (1 - tp_percent / 100.0)
 
-    current_price = get_current_price(symbol)
-    if current_price <= 0:
-        current_price = entry_price
+    current_price = get_current_price(symbol) or entry_price
 
-    precision = 2 if "BTC" in symbol.upper() else 5
-
-    # Safety buffer to prevent immediate trigger
+    # Safety buffer to avoid immediate trigger
     min_distance_pct = 0.5
     if tp_side == "SELL":
         min_allowed = current_price * (1 + min_distance_pct / 100.0)
         if tp_price < min_allowed:
             tp_price = min_allowed
-            logger.warning(f"[{symbol}] TP adjusted upward")
     else:
         max_allowed = current_price * (1 - min_distance_pct / 100.0)
         if tp_price > max_allowed:
             tp_price = max_allowed
-            logger.warning(f"[{symbol}] TP adjusted downward")
 
+    precision = 2 if "BTC" in symbol.upper() else 4 if "ETH" in symbol.upper() else 5
     tp_price_str = f"{tp_price:.{precision}f}"
 
     params = {
@@ -259,26 +241,29 @@ def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_perce
         "stopPrice": tp_price_str,
         "workingType": "MARK_PRICE",
         "reduceOnly": "true",
-        "priceProtect": "true"
+        "priceProtect": "true",
+        "algoType": "CONDITIONAL",      # ← This was missing
+        "timeInForce": "GTC",
     }
 
-    logger.info(f"ALGO TP → {tp_side} {symbol} @ {tp_price_str} "
-                f"({tp_percent:.1f}% from {entry_price:.2f} | Current: {current_price:.2f})")
+    logger.info(f"ALGO TP → {tp_side} {symbol} @ {tp_price_str} ({tp_percent:.1f}%)")
 
     response = signed_request("POST", "/fapi/v1/algoOrder", params)
 
     if isinstance(response, dict):
         if "algoId" in response:
-            logger.info(f"✅ Algo TP Success - algoId: {response.get('algoId')}")
+            logger.info(f"✅ TP Success - algoId: {response.get('algoId')}")
             return response
         else:
-            logger.error(f"❌ Algo TP Failed: {response.get('code')} - {response.get('msg')}")
+            logger.error(f"❌ TP Failed: {response.get('code')} - {response.get('msg')}")
+            logger.error(f"Response: {response}")
     return response
 
 
 def cancel_all_orders(symbol: str):
     signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
     signed_request("DELETE", "/fapi/v1/algo/allOpenOrders", {"symbol": symbol})
+    time.sleep(0.4)
 
 def close_position(symbol: str, reason: str = "manual", update_state: bool = True) -> bool:
     pos = get_current_position_data(symbol)
@@ -402,8 +387,8 @@ async def auto_symbol_selection_task():
 # Trading Loop
 # ────────────────────────────────────────────────
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Dynamic TP + 5% Final Realized PNL Lock")
-    await send_telegram("Bot started • Dynamic TP + 5% Final Realized PNL Lock", silent=False)
+    logger.info("Trading loop started - Fixed Dynamic TP")
+    await send_telegram("Bot started • Fixed Algo TP", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -440,7 +425,7 @@ async def trading_loop(_: Application) -> None:
                 profit_threshold = (PROFIT_LOCK_PCT / 100.0) * notional
 
                 if realized_pnl >= profit_threshold and current_side is not None:
-                    close_position(symbol, f"{PROFIT_LOCK_PCT}% final realized profit lock reached")
+                    close_position(symbol, f"{PROFIT_LOCK_PCT}% final realized profit lock")
                     continue
 
                 current_loss = max(0.0, -realized_pnl)
@@ -458,21 +443,23 @@ async def trading_loop(_: Application) -> None:
                     if sma_prev > day_open:
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
-                            await asyncio.sleep(0.6)
+                            await asyncio.sleep(0.8)
                             sync_position_state(symbol)
                             symbol_position_state[symbol] = "LONG"
                             symbol_entry_price[symbol] = mark_price
                             await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | Dynamic TP: {dynamic_tp:.1f}%", silent=False)
+                            cancel_all_orders(symbol)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
                     elif sma_prev < day_open:
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
-                            await asyncio.sleep(0.6)
+                            await asyncio.sleep(0.8)
                             sync_position_state(symbol)
                             symbol_position_state[symbol] = "SHORT"
                             symbol_entry_price[symbol] = mark_price
                             await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} | Dynamic TP: {dynamic_tp:.1f}%", silent=False)
+                            cancel_all_orders(symbol)
                             place_take_profit_order(symbol, "SELL", mark_price, dynamic_tp, qty)
 
                 elif current_side is not None:
@@ -569,13 +556,10 @@ async def try_remove_symbol(symbol: str, reply_func=None):
         return
     closed = close_position(symbol, "remove")
     monitored_symbols.remove(symbol)
-    symbol_position_state.pop(symbol, None)
-    symbol_entry_price.pop(symbol, None)
-    symbol_last_exit_time.pop(symbol, None)
-    symbol_candle_open_time.pop(symbol, None)
-    symbol_tradeable_from_candle.pop(symbol, None)
-    symbol_cumulative_realized_loss.pop(symbol, None)
-    symbol_realized_pnl_this_candle.pop(symbol, None)
+    for d in [symbol_position_state, symbol_entry_price, symbol_last_exit_time,
+              symbol_candle_open_time, symbol_tradeable_from_candle,
+              symbol_cumulative_realized_loss, symbol_realized_pnl_this_candle]:
+        d.pop(symbol, None)
     configured.discard(symbol)
     if reply_func: await reply_func(f"Removed {symbol}")
 
@@ -631,7 +615,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("🚀 Bot Started with ALGO TAKE_PROFIT_MARKET")
+    print("🚀 Bot Started with FIXED ALGO TAKE_PROFIT_MARKET")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

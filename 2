@@ -53,7 +53,7 @@ COOLDOWN_SECONDS = 3
 BASE_TP_PCT = 1
 OFFSET_PCT = 10
 PROFIT_LOCK_PCT = 1.5
-MAX_DRAWDOWN_PCT = 1
+MAX_DRAWDOWN_PCT = 10
 
 if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("ERROR: Missing config values")
@@ -424,8 +424,8 @@ async def trading_loop(_: Application) -> None:
                 sma_list = [sum(closes[i-2:i+1]) / 3 for i in range(2, len(closes))]
                 if len(sma_list) < 3: continue
 
-                sma_current = sma_list[-1]
-                sma_prev = sma_list[-2]
+                sma_current = sma_list[-2]
+                sma_prev = sma_list[-3]
 
                 logger.info(f"[{symbol}] Side={current_side} | SMA={sma_current:.4f} | DayOpen={day_open:.4f} | "
                            f"OffsetHigh={day_open*1.05:.4f} | OffsetLow={day_open*0.95:.4f} | WaitFor={symbol_wait_for_reversal.get(symbol)}")
@@ -436,7 +436,7 @@ async def trading_loop(_: Application) -> None:
                 if current_side is None and not in_safety:
                     wait_for = symbol_wait_for_reversal.get(symbol)
 
-                    if sma_current > day_open and (wait_for is None or wait_for == "SHORT"):
+                    if sma_current > day_open and and sma_prev < day_open and (wait_for is None or wait_for == "SHORT"):
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             await asyncio.sleep(0.8)
@@ -449,7 +449,7 @@ async def trading_loop(_: Application) -> None:
                             cancel_all_orders(symbol)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
-                    elif sma_current < day_open and (wait_for is None or wait_for == "LONG"):
+                    elif sma_current < day_open and and sma_prev > day_open and (wait_for is None or wait_for == "LONG"):
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             await asyncio.sleep(0.8)

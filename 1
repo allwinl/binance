@@ -40,8 +40,8 @@ TELEGRAM_CHAT_ID = telegram_cfg.get("chat_id")
 ALERT_BOT_USER_ID = telegram_cfg.get("alert_bot_user_id", None)
 
 USE_TESTNET = trading_cfg.get("use_testnet", True)
-
 BASE_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
+
 print("=== TESTNET MODE ===" if USE_TESTNET else "=== MAINNET – REAL MONEY ===")
 
 FIXED_LEVERAGE = 5
@@ -50,23 +50,10 @@ CHECK_INTERVAL_SECONDS = 20
 POSITION_TOLERANCE = 1e-6
 COOLDOWN_SECONDS = 3
 
-BASE_TP_PCT = 1
+BASE_TP_PCT = 1.0
 OFFSET_PCT = 10
 PROFIT_LOCK_PCT = 1.5
-MAX_DRAWDOWN_PCT = 1
-
-if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    print("ERROR: Missing config values")
-    exit(1)
-
-HEADERS = {"X-MBX-APIKEY": API_KEY}
-
-logging.basicConfig(
-    format='%(asctime)s  %(levelname)-8s  %(message)s',
-    level=logging.INFO,
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+MAX_DRAWDOWN_PCT = 10
 
 # ────────────────────────────────────────────────
 # State
@@ -81,13 +68,23 @@ symbol_candle_open_time: Dict[str, float] = {}
 symbol_tradeable_from_candle: Dict[str, float] = {}
 symbol_cumulative_realized_loss: Dict[str, float] = {}
 symbol_realized_pnl_this_candle: Dict[str, float] = {}
-symbol_profit_locked_this_candle: Dict[str, bool] = {}   # NEW: Profit Lock Flag
+symbol_tp_order_id: Dict[str, str] = {}
+symbol_blocked_until_candle: Dict[str, float] = {}
 
 _price_precision_cache: Dict[str, int] = {}
 _qty_step_cache: Dict[str, float] = {}
 
 telegram_bot = Bot(token=TELEGRAM_TOKEN)
 configured: Set[str] = set()
+
+logging.basicConfig(
+    format='%(asctime)s  %(levelname)-8s  %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+HEADERS = {"X-MBX-APIKEY": API_KEY}
 
 # ────────────────────────────────────────────────
 # Telegram Helper
@@ -99,7 +96,7 @@ async def send_telegram(msg: str, silent: bool = True):
         logger.error(f"Telegram send failed: {e}")
 
 # ────────────────────────────────────────────────
-# Binance API Helpers
+# Binance Helpers
 # ────────────────────────────────────────────────
 def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
     if params is None: params = {}
@@ -122,8 +119,6 @@ def signed_request(method: str, endpoint: str, params: Dict = None) -> dict:
         return data
     except Exception as e:
         logger.error(f"Request failed {endpoint}: {e}")
-        if 'r' in locals() and hasattr(r, 'text'):
-            logger.error(f"Response body: {r.text}")
         return {"error": str(e)}
 
 def public_get(endpoint: str, params: Dict = None):
@@ -135,6 +130,21 @@ def public_get(endpoint: str, params: Dict = None):
     except Exception as e:
         logger.error(f"Public GET failed {endpoint}: {e}")
         return {}
+
+def get_filtered_perp_symbols() -> List[str]:
+    data = public_get("/fapi/v1/exchangeInfo")
+    filtered = []
+    for s in data.get("symbols", []):
+        if (s.get("contractType") == "PERPETUAL" and 
+            s.get("status") == "TRADING" and 
+            s.get("quoteAsset") == "USDT"):
+            
+            sub_types = [str(x).lower() for x in s.get("underlyingSubType", [])]
+            if any(x in sub_types for x in ["chinese", "meme", "alpha"]):
+                continue
+            filtered.append(s["symbol"])
+    logger.info(f"Loaded {len(filtered)} filtered perpetual symbols")
+    return filtered
 
 def get_price_precision(symbol: str) -> int:
     if symbol in _price_precision_cache: return _price_precision_cache[symbol]
@@ -163,28 +173,21 @@ def get_qty_step(symbol: str) -> float:
     _qty_step_cache[symbol] = 0.001
     return 0.001
 
-def get_all_perp_symbols() -> List[str]:
-    data = public_get("/fapi/v1/exchangeInfo")
-    return [s["symbol"] for s in data.get("symbols", []) 
-            if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"]
-
 def ensure_leverage_and_margin(symbol: str) -> bool:
     if symbol in configured: return True
     pos_data = signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not isinstance(pos_data, list) or not pos_data: return False
     pos = pos_data[0]
-    lev_ok = int(pos.get("leverage", 0)) == FIXED_LEVERAGE
-    margin_ok = pos.get("isolated", False) == (FIXED_MARGIN_TYPE == "ISOLATED")
     success = True
-    if not lev_ok:
+    if int(pos.get("leverage", 0)) != FIXED_LEVERAGE:
         r = signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": FIXED_LEVERAGE})
         success &= "code" not in r or r["code"] >= 0
-    if not margin_ok:
+    if pos.get("isolated", False) != (FIXED_MARGIN_TYPE == "ISOLATED"):
         r = signed_request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": FIXED_MARGIN_TYPE})
         success &= "code" not in r or r["code"] >= 0
     if success:
         configured.add(symbol)
-        logger.info(f"{symbol}: {FIXED_LEVERAGE}x Isolated set")
+        logger.info(f"{symbol}: {FIXED_LEVERAGE}x Isolated")
     return success
 
 def get_current_position_data(symbol: str) -> dict:
@@ -213,7 +216,7 @@ def get_klines(symbol: str, interval: str, limit: int = 200) -> list:
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        logger.error(f"Klines {symbol} {interval}: {e}")
+        logger.error(f"Klines error {symbol}: {e}")
         return []
 
 def calculate_safe_quantity(symbol: str) -> float:
@@ -231,28 +234,31 @@ def place_market_order(symbol: str, side: str, qty: float, reduce_only: bool = F
     qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
     params = {"symbol": symbol, "side": side.upper(), "type": "MARKET", "quantity": qstr}
     if reduce_only: params["reduceOnly"] = "true"
-    logger.info(f"ORDER {side.upper()} {qstr} {symbol}")
+    logger.info(f"ORDER {side} {qstr} {symbol}")
     return signed_request("POST", "/fapi/v1/order", params)
 
-def place_take_profit_order(symbol: str, side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
-    if qty <= 0 or entry_price <= 0: return {"error": "Invalid params"}
+def place_take_profit_order(symbol: str, position_side: str, entry_price: float, tp_percent: float, qty: float) -> dict:
+    if qty <= 0 or entry_price <= 0:
+        return {"error": "Invalid params"}
     price_prec = get_price_precision(symbol)
-    if side.upper() == "BUY":
+    if position_side.upper() == "BUY":
         tp_side = "SELL"
         tp_price = entry_price * (1 + tp_percent / 100.0)
     else:
         tp_side = "BUY"
         tp_price = entry_price * (1 - tp_percent / 100.0)
+    
     tp_str = f"{tp_price:.{price_prec}f}".rstrip("0").rstrip(".")
     qstr = f"{qty:.6f}".rstrip("0").rstrip(".")
+
     params = {
         "symbol": symbol, "side": tp_side, "type": "LIMIT", "quantity": qstr,
         "price": tp_str, "timeInForce": "GTC", "reduceOnly": "true"
     }
-    logger.info(f"TP LIMIT {tp_side} {symbol} @ {tp_str} ({tp_percent:.1f}%)")
     response = signed_request("POST", "/fapi/v1/order", params)
     if isinstance(response, dict) and response.get("orderId"):
-        logger.info(f"✅ TP Placed - Order ID: {response.get('orderId')}")
+        symbol_tp_order_id[symbol] = str(response["orderId"])
+        logger.info(f"TP Placed {symbol} @ {tp_str} ({tp_percent:.2f}%)")
     return response
 
 def cancel_all_orders(symbol: str):
@@ -282,9 +288,17 @@ def close_position(symbol: str, reason: str = "manual", update_state: bool = Tru
         symbol_last_exit_time[symbol] = time.time()
     return success
 
-# ────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────
+def was_tp_order_filled(symbol: str) -> bool:
+    if symbol not in symbol_tp_order_id:
+        return False
+    try:
+        order = signed_request("GET", "/fapi/v1/order", {
+            "symbol": symbol, "orderId": symbol_tp_order_id[symbol]
+        })
+        return isinstance(order, dict) and order.get("status") == "FILLED"
+    except:
+        return False
+
 def get_realized_pnl_this_candle(symbol: str, candle_open_ts: float) -> float:
     start_time_ms = int(candle_open_ts * 1000)
     realized = 0.0
@@ -296,12 +310,6 @@ def get_realized_pnl_this_candle(symbol: str, candle_open_ts: float) -> float:
             if item.get("incomeType") == "REALIZED_PNL":
                 realized += float(item.get("income", 0.0))
     return realized
-
-def get_current_candle_ts(now: datetime) -> float:
-    hour = now.hour
-    candle_hour = (hour // 8) * 8
-    current_candle = now.replace(hour=candle_hour, minute=0, second=0, microsecond=0)
-    return current_candle.timestamp()
 
 def get_candle_amplitude(symbol: str, candle_open_ts: float) -> float:
     klines = get_klines(symbol, "8h", limit=20)
@@ -317,7 +325,7 @@ def get_candle_amplitude(symbol: str, candle_open_ts: float) -> float:
 # Auto Symbol Selection
 # ────────────────────────────────────────────────
 async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
-    symbols = get_all_perp_symbols()
+    symbols = get_filtered_perp_symbols()
     if not symbols: return None
     target = get_current_candle_ts(now)
     best_symbol = None
@@ -335,8 +343,14 @@ async def get_highest_volatility_symbol(now: datetime) -> Optional[str]:
         logger.info(f"SELECTED → {best_symbol} | Amplitude: {best_amp:.2f}%")
     return best_symbol
 
+def get_current_candle_ts(now: datetime) -> float:
+    hour = now.hour
+    candle_hour = (hour // 8) * 8
+    current_candle = now.replace(hour=candle_hour, minute=0, second=0, microsecond=0)
+    return current_candle.timestamp()
+
 async def auto_symbol_selection_task():
-    await send_telegram("🤖 Scanner Active - 8h Volatility Based", silent=False)
+    await send_telegram("🤖 Scanner Active - 8h Volatility Based (Filtered)", silent=False)
     while True:
         now = datetime.now(timezone.utc)
         should_scan = now.minute >= 45 and now.hour % 8 == 7
@@ -350,7 +364,7 @@ async def auto_symbol_selection_task():
                         for d in [symbol_position_state, symbol_entry_price, symbol_last_exit_time, 
                                   symbol_last_entry_time, symbol_wait_for_reversal, symbol_candle_open_time,
                                   symbol_tradeable_from_candle, symbol_cumulative_realized_loss, 
-                                  symbol_realized_pnl_this_candle, symbol_profit_locked_this_candle]:
+                                  symbol_realized_pnl_this_candle, symbol_tp_order_id, symbol_blocked_until_candle]:
                             d.pop(old, None)
                 if new_symbol not in monitored_symbols:
                     if ensure_leverage_and_margin(new_symbol):
@@ -362,7 +376,6 @@ async def auto_symbol_selection_task():
                         symbol_candle_open_time[new_symbol] = 0
                         symbol_cumulative_realized_loss[new_symbol] = 0.0
                         symbol_realized_pnl_this_candle[new_symbol] = 0.0
-                        symbol_profit_locked_this_candle[new_symbol] = False
                         next_candle = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
                         symbol_tradeable_from_candle[new_symbol] = next_candle.timestamp()
                         amp = get_candle_amplitude(new_symbol, get_current_candle_ts(now))
@@ -372,11 +385,11 @@ async def auto_symbol_selection_task():
             await asyncio.sleep(30)
 
 # ────────────────────────────────────────────────
-# Trading Loop - Main Logic
+# Trading Loop
 # ────────────────────────────────────────────────
 async def trading_loop(_: Application) -> None:
-    logger.info("Trading loop started - Profit Lock per 8h Candle")
-    await send_telegram("Bot started • Profit Lock = No more trades this 8h candle", silent=False)
+    logger.info("Trading loop started - TP Hit = Block until next 8h candle")
+    await send_telegram("Bot started • TP Hit blocks next trade this candle", silent=False)
 
     while True:
         if not monitored_symbols:
@@ -396,52 +409,41 @@ async def trading_loop(_: Application) -> None:
                 current_candle_open_ts = int(klines_8h[-1][0]) / 1000.0
                 day_open = float(klines_8h[-1][1])
 
-                # Reset states on new 8h candle
                 if symbol_candle_open_time.get(symbol, 0) != current_candle_open_ts:
                     symbol_candle_open_time[symbol] = current_candle_open_ts
                     symbol_cumulative_realized_loss[symbol] = 0.0
                     symbol_realized_pnl_this_candle[symbol] = 0.0
-                    symbol_profit_locked_this_candle[symbol] = False
+                    symbol_blocked_until_candle.pop(symbol, None)
+                    symbol_tp_order_id.pop(symbol, None)
 
                 now_ts = time.time()
+
+                if now_ts < symbol_blocked_until_candle.get(symbol, 0):
+                    continue
+
                 if now_ts - current_candle_open_ts < 60: continue
                 if current_candle_open_ts < symbol_tradeable_from_candle.get(symbol, 0) - 10: continue
 
-                # Skip if profit locked this candle
-                if symbol_profit_locked_this_candle.get(symbol, False):
-                    continue
-
-                # Cooldown after entry
                 if current_side is None and (now_ts - symbol_last_entry_time.get(symbol, 0) < COOLDOWN_SECONDS):
                     continue
 
+                # Dynamic TP
                 realized_pnl = get_realized_pnl_this_candle(symbol, current_candle_open_ts)
                 symbol_realized_pnl_this_candle[symbol] = realized_pnl
-
                 notional = qty * mark_price
-                profit_threshold = (PROFIT_LOCK_PCT / 100.0) * notional
-
-                # ==================== PROFIT LOCK ====================
-                if realized_pnl >= profit_threshold and current_side is not None:
-                    success = close_position(symbol, f"{PROFIT_LOCK_PCT}% profit lock")
-                    if success:
-                        symbol_profit_locked_this_candle[symbol] = True
-                        symbol_last_exit_time[symbol] = now_ts
-                        await send_telegram(f"🔒 Profit Lock Hit on {symbol} | No more trades this 8h candle", silent=False)
-                    continue
-
                 current_loss = max(0.0, -realized_pnl)
-                symbol_cumulative_realized_loss[symbol] = current_loss
-                dynamic_tp = BASE_TP_PCT + (current_loss / notional * 100 if notional > 0 else 0)
+                extra_recovery = (current_loss / notional * 100) if notional > 0 else 0.0
+                dynamic_tp = max(BASE_TP_PCT, BASE_TP_PCT + extra_recovery)
 
+                # 1m SMA
                 klines_1m = get_klines(symbol, "1m", limit=40)
                 if len(klines_1m) < 10: continue
                 closes = [float(k[4]) for k in klines_1m]
                 sma_list = [sum(closes[i-2:i+1]) / 3 for i in range(2, len(closes))]
                 if len(sma_list) < 3: continue
 
-                sma_current = sma_list[-1]
-                sma_prev = sma_list[-2]
+                sma_current = sma_list[-2]
+                sma_prev = sma_list[-3]
 
                 in_safety = (now_ts - symbol_last_exit_time.get(symbol, 0)) < 8
 
@@ -449,43 +451,71 @@ async def trading_loop(_: Application) -> None:
                 if current_side is None and not in_safety:
                     wait_for = symbol_wait_for_reversal.get(symbol)
 
-                    if sma_current > day_open and (wait_for is None or wait_for == "SHORT"):
+                    if sma_current > day_open and sma_prev < day_open and (wait_for is None or wait_for == "SHORT"):
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
-                            await asyncio.sleep(0.8)
+                            await asyncio.sleep(1.0)
                             sync_position_state(symbol)
+                            pos = get_current_position_data(symbol)
+                            actual_entry = float(pos.get("entryPrice", mark_price))
+                            
                             symbol_position_state[symbol] = "LONG"
-                            symbol_entry_price[symbol] = mark_price
+                            symbol_entry_price[symbol] = actual_entry
                             symbol_last_entry_time[symbol] = now_ts
                             symbol_wait_for_reversal[symbol] = None
-                            await send_telegram(f"🟢 LONG {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
+                            
+                            await send_telegram(f"🟢 LONG {symbol} @ {actual_entry:.4f} | TP: {dynamic_tp:.1f}%", silent=False)
                             cancel_all_orders(symbol)
-                            place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
+                            place_take_profit_order(symbol, "BUY", actual_entry, dynamic_tp, qty)
 
-                    elif sma_current < day_open and (wait_for is None or wait_for == "LONG"):
+                    elif sma_current < day_open and sma_prev > day_open and (wait_for is None or wait_for == "LONG"):
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
-                            await asyncio.sleep(0.8)
+                            await asyncio.sleep(1.0)
                             sync_position_state(symbol)
+                            pos = get_current_position_data(symbol)
+                            actual_entry = float(pos.get("entryPrice", mark_price))
+                            
                             symbol_position_state[symbol] = "SHORT"
-                            symbol_entry_price[symbol] = mark_price
+                            symbol_entry_price[symbol] = actual_entry
                             symbol_last_entry_time[symbol] = now_ts
                             symbol_wait_for_reversal[symbol] = None
-                            await send_telegram(f"🔴 SHORT {symbol} @ {mark_price:.2f} | TP: {dynamic_tp:.1f}%", silent=False)
+                            
+                            await send_telegram(f"🔴 SHORT {symbol} @ {actual_entry:.4f} | TP: {dynamic_tp:.1f}%", silent=False)
                             cancel_all_orders(symbol)
-                            place_take_profit_order(symbol, "SELL", mark_price, dynamic_tp, qty)
+                            place_take_profit_order(symbol, "SELL", actual_entry, dynamic_tp, qty)
 
-                # ==================== EXIT ====================
+                # ==================== EXIT & TP DETECTION ====================
                 elif current_side is not None:
                     pos = get_current_position_data(symbol)
+                    amt = float(pos.get("positionAmt", 0))
+
+                    if abs(amt) < POSITION_TOLERANCE:
+                        is_tp_hit = was_tp_order_filled(symbol) or (realized_pnl > 0.1)
+                        
+                        symbol_position_state[symbol] = None
+                        symbol_entry_price[symbol] = None
+                        symbol_last_exit_time[symbol] = now_ts
+                        symbol_tp_order_id.pop(symbol, None)
+
+                        if is_tp_hit:
+                            next_candle_ts = current_candle_open_ts + 8 * 3600
+                            symbol_blocked_until_candle[symbol] = next_candle_ts
+                            await send_telegram(f"✅ {current_side} TP Hit {symbol}\nNo more trades this 8h candle", silent=False)
+                        else:
+                            await send_telegram(f"⚠️ {current_side} Position Closed {symbol}", silent=False)
+                        continue
+
+                    # Drawdown Protection
                     unrealized = float(pos.get("unRealizedProfit", 0))
-                    unrealized_pct = (unrealized / notional * 100) if notional > 0 else 0
+                    notional_pos = abs(amt) * mark_price
+                    unrealized_pct = (unrealized / notional_pos * 100) if notional_pos > 0 else 0
 
                     if unrealized_pct < -MAX_DRAWDOWN_PCT:
                         close_position(symbol, f"drawdown protection (-{MAX_DRAWDOWN_PCT}%)")
                         continue
 
-                    # Offset Crossover Exit
+                    # Offset Crossover Exit (No blocking)
                     if current_side == "LONG":
                         offset_high = day_open * (1 + OFFSET_PCT / 100.0)
                         if sma_current < offset_high and sma_prev >= offset_high:
@@ -519,8 +549,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for sym in sorted(monitored_symbols):
         side = symbol_position_state.get(sym, "—")
         wait = symbol_wait_for_reversal.get(sym, "None")
-        locked = "🔒" if symbol_profit_locked_this_candle.get(sym, False) else ""
-        lines.append(f"  {sym:10}  {side}  {locked}")
+        lines.append(f"  {sym:10}  {side}  (Wait: {wait})")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -531,28 +560,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for sym in sorted(monitored_symbols):
         realized = symbol_realized_pnl_this_candle.get(sym, 0.0)
         side = symbol_position_state.get(sym, "None")
-        locked = "🔒 LOCKED this candle" if symbol_profit_locked_this_candle.get(sym, False) else ""
-        lines.append(f"**{sym}** | PNL: {realized:.2f} | Pos: {side} {locked}")
+        blocked = "Yes" if sym in symbol_blocked_until_candle else "No"
+        lines.append(f"**{sym}** | PNL: {realized:.2f} | Pos: {side} | Blocked: {blocked}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    closed = [sym for sym in list(monitored_symbols) if close_position(sym, "reset")]
+    for sym in list(monitored_symbols):
+        close_position(sym, "reset")
     monitored_symbols.clear()
     for d in [symbol_position_state, symbol_entry_price, symbol_last_exit_time, symbol_last_entry_time,
               symbol_wait_for_reversal, symbol_candle_open_time, symbol_tradeable_from_candle,
-              symbol_cumulative_realized_loss, symbol_realized_pnl_this_candle, symbol_profit_locked_this_candle]:
+              symbol_cumulative_realized_loss, symbol_realized_pnl_this_candle, symbol_tp_order_id,
+              symbol_blocked_until_candle]:
         d.clear()
     configured.clear()
-    text = "Full reset performed."
-    if closed:
-        text += f"\nClosed: {', '.join(closed)}"
-    await update.message.reply_text(text)
+    await update.message.reply_text("Full reset performed.")
     await send_telegram("Bot reset")
 
 async def try_add_symbol(symbol: str, reply_func=None):
     symbol = symbol.strip().upper()
-    if not symbol.endswith("USDT") or symbol not in get_all_perp_symbols():
-        if reply_func: await reply_func(f"Invalid symbol: {symbol}")
+    if not symbol.endswith("USDT") or symbol not in get_filtered_perp_symbols():
+        if reply_func: await reply_func(f"Invalid or filtered symbol: {symbol}")
         return
     if symbol in monitored_symbols:
         if reply_func: await reply_func(f"{symbol} already monitored")
@@ -560,13 +588,6 @@ async def try_add_symbol(symbol: str, reply_func=None):
     if ensure_leverage_and_margin(symbol):
         monitored_symbols.add(symbol)
         symbol_position_state[symbol] = None
-        symbol_last_exit_time[symbol] = 0
-        symbol_last_entry_time[symbol] = 0
-        symbol_wait_for_reversal[symbol] = None
-        symbol_candle_open_time[symbol] = 0
-        symbol_cumulative_realized_loss[symbol] = 0.0
-        symbol_realized_pnl_this_candle[symbol] = 0.0
-        symbol_profit_locked_this_candle[symbol] = False
         if reply_func: await reply_func(f"Added {symbol}")
 
 async def try_remove_symbol(symbol: str, reply_func=None):
@@ -574,11 +595,12 @@ async def try_remove_symbol(symbol: str, reply_func=None):
     if symbol not in monitored_symbols:
         if reply_func: await reply_func(f"{symbol} not monitored")
         return
-    closed = close_position(symbol, "remove")
+    close_position(symbol, "remove")
     monitored_symbols.remove(symbol)
     for d in [symbol_position_state, symbol_entry_price, symbol_last_exit_time, symbol_last_entry_time,
               symbol_wait_for_reversal, symbol_candle_open_time, symbol_tradeable_from_candle,
-              symbol_cumulative_realized_loss, symbol_realized_pnl_this_candle, symbol_profit_locked_this_candle]:
+              symbol_cumulative_realized_loss, symbol_realized_pnl_this_candle, symbol_tp_order_id,
+              symbol_blocked_until_candle]:
         d.pop(symbol, None)
     configured.discard(symbol)
     if reply_func: await reply_func(f"Removed {symbol}")
@@ -598,14 +620,10 @@ async def cmd_rem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_alert_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ALERT_BOT_USER_ID: return
     text = update.message.text.strip().upper()
-    if not text.startswith(("/add ", "/rem ")): return
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2: return
-    cmd, symbol = parts[0], parts[1].strip()
-    if cmd == "/add":
-        await try_add_symbol(symbol)
-    elif cmd == "/rem":
-        await try_remove_symbol(symbol)
+    if text.startswith("/add "):
+        await try_add_symbol(text.split(maxsplit=1)[1])
+    elif text.startswith("/rem "):
+        await try_remove_symbol(text.split(maxsplit=1)[1])
 
 async def on_startup(app: Application) -> None:
     asyncio.create_task(trading_loop(app))
@@ -630,7 +648,7 @@ def main():
         ))
 
     app.post_init = on_startup
-    print("🚀 Bot Started with Profit Lock per 8h Candle")
+    print("🚀 Bot Started with TP Block Logic")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

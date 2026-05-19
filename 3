@@ -415,8 +415,8 @@ async def trading_loop(_: Application) -> None:
                 df['close'] = pd.to_numeric(df['close'])
                 df['sma3'] = ta.sma(df['close'], length=3)
 
-                sma_current = df['sma3'].iloc[-1]
-                sma_prev = df['sma3'].iloc[-2] if len(df) > 1 else sma_current
+                sma_current = df['sma3'].iloc[-2]
+                sma_prev = df['sma3'].iloc[-3] if len(df) > 1 else sma_current
 
                 in_safety = (now_ts - symbol_last_exit_time.get(symbol, 0)) < 8
 
@@ -424,7 +424,7 @@ async def trading_loop(_: Application) -> None:
                 if current_side is None and not in_safety:
                     wait_for = symbol_wait_for_reversal.get(symbol)
 
-                    if sma_current > day_open and (wait_for is None or wait_for == "SHORT"): # sma_prev < day_open and (wait_for is None or wait_for == "SHORT"):
+                    if sma_current > day_open and sma_prev < day_open and (wait_for is None or wait_for == "SHORT"):
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_entry_count_this_candle[symbol] = entry_count + 1
@@ -442,7 +442,7 @@ async def trading_loop(_: Application) -> None:
                             cancel_all_orders(symbol)
                             place_take_profit_order(symbol, "BUY", actual_entry, dynamic_tp, qty)
 
-                    elif sma_current < day_open and (wait_for is None or wait_for == "LONG"): # sma_prev > day_open and (wait_for is None or wait_for == "LONG"):
+                    elif sma_current < day_open and sma_prev > day_open and (wait_for is None or wait_for == "LONG"):
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             symbol_entry_count_this_candle[symbol] = entry_count + 1

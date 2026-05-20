@@ -218,7 +218,7 @@ def calculate_safe_quantity(symbol: str) -> float:
     price = get_current_price(symbol)
     if price <= 0: return 0.0
     step = get_qty_step(symbol)
-    raw = 12.0 / price
+    raw = 100.0 / price
     steps = math.ceil(raw / step)
     return round(max(steps * step, step), 6)
 
@@ -444,7 +444,7 @@ async def trading_loop(_: Application) -> None:
                 # ENTRY
                 if current_side is None and not in_safety:
                     wait_for = symbol_wait_for_reversal.get(symbol)
-                    if sma_current > day_open and sma_prev < day_open and (wait_for is None or wait_for == "SHORT"):
+                    if sma_current > day_open and (wait_for is None or wait_for == "SHORT"): # sma_prev < day_open and (wait_for is None or wait_for == "SHORT"):
                         resp = place_market_order(symbol, "BUY", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             await asyncio.sleep(0.8)
@@ -457,7 +457,7 @@ async def trading_loop(_: Application) -> None:
                             cancel_all_orders(symbol)
                             place_take_profit_order(symbol, "BUY", mark_price, dynamic_tp, qty)
 
-                    elif sma_current < day_open and sma_prev > day_open and (wait_for is None or wait_for == "LONG"):
+                    elif sma_current < day_open and (wait_for is None or wait_for == "LONG"): # sma_prev > day_open and (wait_for is None or wait_for == "LONG"):
                         resp = place_market_order(symbol, "SELL", qty)
                         if resp.get("status") in ("NEW", "FILLED"):
                             await asyncio.sleep(0.8)

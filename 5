@@ -52,9 +52,9 @@ CHECK_INTERVAL_SECONDS = 20
 POSITION_TOLERANCE = 1e-6
 COOLDOWN_SECONDS = 3
 
-BASE_TP_PCT = 1.0
+BASE_TP_PCT = 1.12
 OFFSET_PCT = 10
-PROFIT_LOCK_PCT = 1.5
+PROFIT_LOCK_PCT = 1.12
 MAX_DRAWDOWN_PCT = 10
 ROUND_TRIP_FEE_PCT = 0.12
 
@@ -436,8 +436,8 @@ async def trading_loop(_: Application) -> None:
                 sma_series = ta.sma(df['close'], length=3)
                 if len(sma_series) < 3: continue
 
-                sma_current = sma_series.iloc[-1]
-                sma_prev = sma_series.iloc[-2]
+                sma_current = sma_series.iloc[-2]
+                sma_prev = sma_series.iloc[-3]
 
                 in_safety = (now_ts - symbol_last_exit_time.get(symbol, 0)) < 8
 
